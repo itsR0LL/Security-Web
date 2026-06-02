@@ -1,0 +1,15 @@
+{
+  "name": "security-log-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:create": "wrangler d1 create security_studio_logs",
+    "d1:migrate:local": "wrangler d1 execute security_studio_logs --local --file=./schema.sql",
+    "d1:migrate:remote": "wrangler d1 execute security_studio_logs --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.55.0"
+  }
+}

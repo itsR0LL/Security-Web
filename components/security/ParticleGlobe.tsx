@@ -690,7 +690,8 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
     points
       .filter(
         (point) =>
-          riskWeight[point.riskLevel] >= 2 || ["block", "challenge", "managed_challenge"].includes(point.action ?? ""),
+          riskWeight[point.riskLevel] >= 2 ||
+          ["block", "blocked", "challenge", "managed_challenge", "js_challenge", "log", "simulate"].includes(point.action ?? ""),
       )
       .slice(0, 16)
       .forEach((point, index) => {

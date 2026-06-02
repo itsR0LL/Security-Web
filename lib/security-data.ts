@@ -6,6 +6,8 @@ export type SecurityDataMode = "live" | "degraded" | "stale" | "mock" | "mock-cl
 
 export type LocationPrecision = "city" | "region" | "country" | "estimated";
 
+export type TrafficKind = "visit" | "attack";
+
 export type SecurityRuleHit = {
   id: string;
   name: string;
@@ -37,7 +39,7 @@ export type SecurityEvent = {
   userAgent: string;
   referer?: string;
   rayId: string;
-  action: "allow" | "block" | "challenge" | "managed_challenge" | "log";
+  action: "allow" | "block" | "blocked" | "challenge" | "managed_challenge" | "js_challenge" | "log" | "simulate";
   ruleId: string;
   ruleName: string;
   eventType: string;
@@ -100,7 +102,11 @@ export type GlobePoint = {
   count: number;
   riskLevel: RiskLevel;
   eventType: string;
+  trafficKind?: TrafficKind;
   locationPrecision: LocationPrecision;
+  source?: SecurityEvent["source"] | "cloudflare_http_aggregate" | "raw_events";
+  sourceType?: "normal_visit" | "security_event" | "raw_event";
+  bandwidthBytes?: number;
   action?: SecurityEvent["action"];
   method?: SecurityEvent["method"];
   path?: string;
@@ -178,6 +184,24 @@ export const riskLabels: Record<RiskLevel, string> = {
 };
 
 export const riskOrder: RiskLevel[] = ["info", "low", "medium", "high", "critical"];
+
+export function resolveTrafficKind(input: { eventType?: string; riskLevel?: RiskLevel; action?: SecurityEvent["action"] }): TrafficKind {
+  if (input.eventType === "normal_visit" || input.eventType === "正常访问") return "visit";
+  if (input.action === "allow" && (input.riskLevel === "info" || input.riskLevel === "low")) return "visit";
+  if (
+    input.action === "block" ||
+    input.action === "blocked" ||
+    input.action === "challenge" ||
+    input.action === "managed_challenge" ||
+    input.action === "js_challenge" ||
+    input.action === "log" ||
+    input.action === "simulate"
+  ) {
+    return "attack";
+  }
+  if (input.riskLevel === "info" || input.riskLevel === "low") return "visit";
+  return "attack";
+}
 
 const destination = {
   city: "成都",
@@ -716,6 +740,7 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       count: topIps[index]?.value ?? Math.max(8, 34 - index * 3),
       riskLevel: event.riskLevel,
       eventType: event.eventType,
+      trafficKind: resolveTrafficKind(event),
       locationPrecision: event.locationPrecision,
       action: event.action,
       method: event.method,

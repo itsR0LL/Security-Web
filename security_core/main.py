@@ -9,7 +9,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from .cloudflare_client import CloudflareClient, CloudflareClientError
-from .config import DEFAULT_ALLOWED_ORIGINS
+from .config import DEFAULT_ALLOWED_ORIGINS, WORKER_LOG_EXPORT_TOKEN, WORKER_LOG_EXPORT_URL
 from .database import init_db, utc_now
 from .event_normalizer import build_http_aggregate_rows, normalize_security_events
 from .repository import (
@@ -22,9 +22,11 @@ from .repository import (
     get_overview,
     get_rules,
     get_settings,
+    get_state,
     get_sync_status,
     get_traffic_trend,
     has_cloudflare_token,
+    insert_worker_logs,
     list_events,
     map_payload,
     normalize_event_limit,
@@ -32,11 +34,13 @@ from .repository import (
     replace_cloudflare_aggregates,
     replace_cloudflare_events,
     seed_sample_dataset,
+    set_state,
     source_summary,
     update_cloudflare_settings,
     update_risk_threshold,
 )
 from .token_check import check_cloudflare_token
+from .worker_log_client import WorkerLogClientError, fetch_worker_log_export
 
 
 def api_success(data: Any, **extra: Any) -> dict[str, Any]:
@@ -87,6 +91,28 @@ def is_allowed_origin(origin: str) -> bool:
     if cleaned in configured_origins():
         return True
     return cleaned.startswith("http://127.0.0.1:") or cleaned.startswith("http://localhost:")
+
+
+def sync_worker_logs_once(limit: int = 500) -> dict[str, Any]:
+    cursor = int(get_state("worker_log_export_cursor", "0") or 0)
+    exported = fetch_worker_log_export(WORKER_LOG_EXPORT_URL, WORKER_LOG_EXPORT_TOKEN, cursor=cursor, limit=limit)
+    result = insert_worker_logs(exported.rows)
+    set_state("worker_log_export_cursor", str(exported.next_cursor))
+    create_sync_run(
+        status="success",
+        event_count=result["events"],
+        aggregate_count=result["aggregates"],
+        used_stale_data=False,
+    )
+    return {
+        "mode": "worker_log",
+        "status": "success",
+        "cursor": exported.cursor,
+        "nextCursor": exported.next_cursor,
+        "hasMore": exported.has_more,
+        **result,
+        "message": "Worker access logs synced.",
+    }
 
 
 def cors_headers(origin: str) -> dict[str, str]:
@@ -230,6 +256,22 @@ def aggregate_map() -> dict[str, Any]:
 @app.get("/api/sync/status")
 def sync_status() -> dict[str, Any]:
     return api_success(get_sync_status())
+
+
+@app.post("/api/worker-logs/sync")
+def worker_logs_sync(limit: int = 500) -> dict[str, Any]:
+    try:
+        return api_success(sync_worker_logs_once(limit=max(1, min(limit, 1000))))
+    except WorkerLogClientError as error:
+        create_sync_run(status="failed", error_message=str(error), used_stale_data=True)
+        return api_success(
+            {
+                "mode": "worker_log",
+                "status": "failed",
+                "usedStaleData": True,
+                "message": str(error),
+            }
+        )
 
 
 @app.post("/api/sync/run")

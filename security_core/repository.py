@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .access_log_normalizer import normalize_worker_access_log, worker_access_log_to_event
 from .config import (
     AGGREGATE_RETENTION_LABEL,
     CHENGDU_DESTINATION,
@@ -14,6 +15,7 @@ from .config import (
     RISK_ORDER,
 )
 from .database import db_session, utc_now
+from .geo import stable_country_coordinates
 from .rule_matcher import apply_rule_matching, normalize_rule_row
 from .sample_data import create_sample_events, create_sample_traffic_trend
 
@@ -28,6 +30,7 @@ def _json_loads(value: str | None, fallback: Any) -> Any:
 
 
 SENSITIVE_KEY_PARTS = ("token", "authorization", "api_key", "apikey", "secret", "password")
+SPECIFIC_PRIMARY_RULE_TYPES = {"path_keyword", "query_keyword", "user_agent_keyword"}
 
 
 def _sanitize_sensitive(value: Any) -> Any:
@@ -82,8 +85,17 @@ def has_cloudflare_token() -> bool:
     return bool(get_cloudflare_token())
 
 
+def has_worker_log_data() -> bool:
+    try:
+        with db_session() as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM access_logs").fetchone()
+        return int(row["count"]) > 0
+    except Exception:
+        return False
+
+
 def is_sample_mode() -> bool:
-    return not has_cloudflare_token()
+    return not has_cloudflare_token() and not has_worker_log_data()
 
 
 def active_source_filter() -> tuple[str, list[Any]]:
@@ -191,13 +203,52 @@ def row_to_event(row: Any) -> dict[str, Any]:
     }
 
 
+def _risk_rank(level: Any) -> int:
+    risk_level = str(level or "info")
+    return RISK_ORDER.index(risk_level) if risk_level in RISK_ORDER else RISK_ORDER.index("info")
+
+
+def _select_primary_rule_hit(hits: list[dict[str, Any]]) -> dict[str, Any] | None:
+    active_hits = [hit for hit in hits if hit.get("mode") == "active"]
+    if not active_hits:
+        return None
+    specific_hits = [hit for hit in active_hits if hit.get("ruleType") in SPECIFIC_PRIMARY_RULE_TYPES]
+    selected_hits = specific_hits or active_hits
+    return max(selected_hits, key=lambda hit: _risk_rank(hit.get("severity")))
+
+
+def _apply_primary_rule_precedence(event: dict[str, Any]) -> dict[str, Any]:
+    hits = event.get("ruleHits")
+    if not isinstance(hits, list):
+        return event
+    primary_hit = _select_primary_rule_hit([hit for hit in hits if isinstance(hit, dict)])
+    if not primary_hit:
+        return event
+
+    event["ruleId"] = primary_hit.get("ruleId", "")
+    event["ruleName"] = primary_hit.get("ruleName", "")
+    event["attackCategory"] = primary_hit.get("attackCategory", "")
+    event["attackSubtype"] = primary_hit.get("attackSubtype", "")
+    event["toolSignature"] = primary_hit.get("toolSignature", "")
+    event["behaviorFingerprint"] = primary_hit.get("behaviorFingerprint", "")
+    event["ruleVersion"] = primary_hit.get("version", event.get("ruleVersion", ""))
+    if primary_hit.get("attackSubtype"):
+        event["eventType"] = primary_hit["attackSubtype"]
+
+    raw = event.get("raw")
+    if isinstance(raw, dict):
+        raw["primaryRuleId"] = event["ruleId"]
+        raw["primaryRuleType"] = primary_hit.get("ruleType", "")
+    return event
+
+
 def insert_events(events: list[dict[str, Any]]) -> int:
     if not events:
         return 0
     with db_session() as connection:
         rule_rows = connection.execute("SELECT * FROM rules ORDER BY id ASC").fetchall()
         rules = [normalize_rule_row(row) for row in rule_rows]
-        matched_events = [apply_rule_matching(event, rules) for event in events]
+        matched_events = [_apply_primary_rule_precedence(apply_rule_matching(event, rules)) for event in events]
         connection.executemany(
             """
             INSERT INTO raw_events (
@@ -249,6 +300,175 @@ def insert_events(events: list[dict[str, Any]]) -> int:
             [event_to_row(event) for event in matched_events],
         )
     return len(events)
+
+
+def access_log_to_row(log: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        log["id"],
+        log.get("source", "worker_log"),
+        int(log.get("sourceCursor") or 0),
+        log.get("receivedAt", utc_now()),
+        log.get("timestamp", utc_now()),
+        log.get("clientIp", ""),
+        log.get("ipHash", ""),
+        log.get("country", ""),
+        log.get("region", ""),
+        log.get("city", ""),
+        log.get("colo", ""),
+        float(log.get("latitude") or 0),
+        float(log.get("longitude") or 0),
+        log.get("locationPrecision", "estimated"),
+        log.get("method", "GET"),
+        log.get("host", get_monitored_host()),
+        log.get("path", "/"),
+        log.get("query") or "",
+        int(log.get("statusCode") or 0),
+        log.get("userAgent", ""),
+        log.get("referer") or "",
+        log.get("rayId", ""),
+        log.get("requestId", ""),
+        int(log.get("responseBytes") or 0),
+        json.dumps(log.get("raw", {}), ensure_ascii=False),
+        utc_now(),
+    )
+
+
+def insert_access_logs(logs: list[dict[str, Any]]) -> int:
+    if not logs:
+        return 0
+    with db_session() as connection:
+        connection.executemany(
+            """
+            INSERT INTO access_logs (
+                id, source, source_cursor, received_at, occurred_at, client_ip, ip_hash,
+                country, region, city, colo, latitude, longitude, location_precision,
+                method, host, path, query, status_code, user_agent, referer, cf_ray,
+                request_id, response_bytes, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                source_cursor = excluded.source_cursor,
+                received_at = excluded.received_at,
+                status_code = excluded.status_code,
+                response_bytes = excluded.response_bytes,
+                raw_json = excluded.raw_json
+            """,
+            [access_log_to_row(log) for log in logs],
+        )
+    return len(logs)
+
+
+def _aggregate_bucket_start(timestamp: str) -> str:
+    parsed = parse_iso_datetime(timestamp)
+    return parsed.replace(minute=0, second=0, microsecond=0).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _aggregate_value(value: Any, fallback: str = "unknown") -> str:
+    normalized = str(value or "").strip()
+    return normalized if normalized else fallback
+
+
+def _worker_aggregate_rows(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for log in logs:
+        bucket_start = _aggregate_bucket_start(log.get("timestamp", utc_now()))
+        status_code = int(log.get("statusCode") or 0)
+        response_bytes = int(log.get("responseBytes") or 0)
+        dimensions = {
+            "worker_log:country": _aggregate_value(log.get("country")),
+            "worker_log:path": _aggregate_value(log.get("path"), "/"),
+            "worker_log:status": str(status_code),
+            "worker_log:traffic": "all",
+        }
+        for dimension, dimension_value in dimensions.items():
+            key = (bucket_start, dimension, dimension_value)
+            if key not in aggregates:
+                aggregates[key] = {
+                    "id": f"{dimension}:{bucket_start}:{dimension_value}",
+                    "bucket_type": "hour",
+                    "bucket_start": bucket_start,
+                    "dimension": dimension,
+                    "dimension_value": dimension_value,
+                    "total_count": 0,
+                    "threat_count": 0,
+                    "blocked_count": 0,
+                    "challenge_count": 0,
+                    "bandwidth_bytes": 0,
+                    "cached_bytes": 0,
+                    "origin_bytes": 0,
+                }
+            item = aggregates[key]
+            item["total_count"] += 1
+            item["bandwidth_bytes"] += response_bytes
+            item["origin_bytes"] += response_bytes
+            if status_code >= 400:
+                item["threat_count"] += 1
+    return list(aggregates.values())
+
+
+def upsert_worker_log_aggregates(rows: list[dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    created_at = utc_now()
+    with db_session() as connection:
+        connection.executemany(
+            """
+            INSERT INTO event_aggregates (
+                id, bucket_type, bucket_start, dimension, dimension_value,
+                total_count, threat_count, blocked_count, challenge_count,
+                bandwidth_bytes, cached_bytes, origin_bytes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                total_count = total_count + excluded.total_count,
+                threat_count = threat_count + excluded.threat_count,
+                blocked_count = blocked_count + excluded.blocked_count,
+                challenge_count = challenge_count + excluded.challenge_count,
+                bandwidth_bytes = bandwidth_bytes + excluded.bandwidth_bytes,
+                cached_bytes = cached_bytes + excluded.cached_bytes,
+                origin_bytes = origin_bytes + excluded.origin_bytes,
+                created_at = excluded.created_at
+            """,
+            [
+                (
+                    row["id"],
+                    row.get("bucket_type", "hour"),
+                    row.get("bucket_start", utc_now()),
+                    row["dimension"],
+                    row.get("dimension_value", "all"),
+                    int(row.get("total_count") or 0),
+                    int(row.get("threat_count") or 0),
+                    int(row.get("blocked_count") or 0),
+                    int(row.get("challenge_count") or 0),
+                    int(row.get("bandwidth_bytes") or 0),
+                    int(row.get("cached_bytes") or 0),
+                    int(row.get("origin_bytes") or 0),
+                    created_at,
+                )
+                for row in rows
+                if str(row.get("dimension") or "").startswith("worker_log:")
+            ],
+        )
+    return len([row for row in rows if str(row.get("dimension") or "").startswith("worker_log:")])
+
+
+def insert_worker_logs(export_rows: list[dict[str, Any]]) -> dict[str, int]:
+    logs = [normalize_worker_access_log(row) for row in export_rows]
+    if not logs:
+        return {"accessLogs": 0, "events": 0, "aggregates": 0}
+    access_log_count = insert_access_logs(logs)
+    aggregate_count = upsert_worker_log_aggregates(_worker_aggregate_rows(logs))
+
+    with db_session() as connection:
+        rule_rows = connection.execute("SELECT * FROM rules ORDER BY id ASC").fetchall()
+    rules = [normalize_rule_row(row) for row in rule_rows]
+    events = []
+    for log in logs:
+        matched_event = _apply_primary_rule_precedence(apply_rule_matching(worker_access_log_to_event(log), rules))
+        risk_level = str(matched_event.get("riskLevel") or "info")
+        rule_hits = matched_event.get("ruleHits")
+        if risk_level != "info" or (isinstance(rule_hits, list) and len(rule_hits) > 0):
+            events.append(matched_event)
+    event_count = insert_events(events)
+    return {"accessLogs": access_log_count, "events": event_count, "aggregates": aggregate_count}
 
 
 def seed_traffic_aggregates(source: str = "sample") -> int:
@@ -633,9 +853,24 @@ def get_event(event_id: str) -> dict[str, Any] | None:
     return event
 
 
+def has_aggregate_dimension(dimension: str) -> bool:
+    with db_session() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM event_aggregates WHERE dimension = ?",
+            (dimension,),
+        ).fetchone()
+    return int(row["count"]) > 0
+
+
+def preferred_live_aggregate_dimension(suffix: str) -> str:
+    worker_dimension = f"worker_log:{suffix}"
+    if has_aggregate_dimension(worker_dimension):
+        return worker_dimension
+    return f"cloudflare:{suffix}"
+
+
 def get_traffic_trend() -> list[dict[str, Any]]:
-    source_prefix = "sample" if is_sample_mode() else "cloudflare"
-    dimension = f"{source_prefix}:traffic"
+    dimension = "sample:traffic" if is_sample_mode() else preferred_live_aggregate_dimension("traffic")
     with db_session() as connection:
         rows = connection.execute(
             """
@@ -692,6 +927,8 @@ def _distribution(field: str, label_map: dict[str, str] | None = None) -> list[d
         item: dict[str, Any] = {"label": label, "value": int(row["value"])}
         if field == "risk_level":
             item["riskLevel"] = raw_label
+        if field == "event_type":
+            item["riskLevel"] = normalize_max_risk_for_label(raw_label, field)
         items.append(item)
     return items
 
@@ -737,7 +974,7 @@ def _ranked(field: str, detail_field: str | None = None) -> list[dict[str, Any]]
 
 
 def normalize_max_risk_for_label(label: str, field: str) -> str:
-    allowed_fields = {"client_ip", "path", "user_agent", "country"}
+    allowed_fields = {"client_ip", "path", "user_agent", "country", "event_type"}
     if field not in allowed_fields:
         return "info"
     source_clause, source_params = active_source_filter()
@@ -754,8 +991,69 @@ def normalize_max_risk_for_label(label: str, field: str) -> str:
     return highest
 
 
-def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
+def get_country_aggregate_globe_points(source: str, limit: int = 50) -> list[dict[str, Any]]:
+    if is_sample_mode():
+        return []
+    dimension = f"{source}:country"
+    with db_session() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                dimension_value,
+                SUM(total_count) AS total_count,
+                SUM(bandwidth_bytes) AS bandwidth_bytes
+            FROM event_aggregates
+            WHERE dimension = ? AND dimension_value != ''
+            GROUP BY dimension_value
+            ORDER BY total_count DESC
+            LIMIT ?
+            """,
+            (dimension, limit),
+        ).fetchall()
+
+    points = []
+    for row in rows:
+        country = str(row["dimension_value"])
+        count = int(row["total_count"] or 0)
+        bandwidth_bytes = int(row["bandwidth_bytes"] or 0)
+        latitude, longitude, location_precision = stable_country_coordinates(country)
+        points.append(
+            {
+                "id": f"{source}:country:{country}",
+                "label": f"{country} normal_visit",
+                "clientIp": "",
+                "country": country,
+                "city": "",
+                "latitude": latitude,
+                "longitude": longitude,
+                "count": count,
+                "riskLevel": "info",
+                "eventType": "normal_visit",
+                "locationPrecision": location_precision,
+                "action": "allow",
+                "source": f"{source}_aggregate",
+                "sourceType": "normal_visit",
+                "trafficKind": "visit",
+                "bandwidthBytes": bandwidth_bytes,
+                "throughputMb": round(bandwidth_bytes / 1024 / 1024, 1),
+            }
+        )
+    return points
+
+
+def get_cloudflare_country_globe_points(limit: int = 50) -> list[dict[str, Any]]:
+    return get_country_aggregate_globe_points("cloudflare", limit)
+
+
+def get_worker_log_country_globe_points(limit: int = 50) -> list[dict[str, Any]]:
+    return get_country_aggregate_globe_points("worker_log", limit)
+
+
+def get_raw_event_globe_points(limit: int = 50) -> list[dict[str, Any]]:
     source_clause, source_params = active_source_filter()
+    security_filter = ""
+    if not is_sample_mode():
+        security_filter = " AND (risk_level != 'info' OR action IN ('block', 'challenge', 'managed_challenge', 'js_challenge', 'log', 'simulate'))"
     with db_session() as connection:
         rows = connection.execute(
             """
@@ -763,17 +1061,44 @@ def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
                 client_ip, country, city, latitude, longitude, location_precision,
                 COUNT(*) AS count
             FROM raw_events
-            WHERE """ + source_clause + """
+            WHERE """ + source_clause + security_filter + """
             GROUP BY client_ip, country, city, latitude, longitude, location_precision
             ORDER BY count DESC
             LIMIT ?
             """,
             (*source_params, limit),
         ).fetchall()
+        latest_rows = [
+            connection.execute(
+                f"""
+                SELECT * FROM raw_events
+                WHERE {source_clause}
+                    AND client_ip = ?
+                    AND country = ?
+                    AND city = ?
+                    AND latitude = ?
+                    AND longitude = ?
+                    AND location_precision = ?
+                    {security_filter}
+                ORDER BY occurred_at DESC
+                LIMIT 1
+                """,
+                (
+                    *source_params,
+                    row["client_ip"],
+                    row["country"],
+                    row["city"],
+                    row["latitude"],
+                    row["longitude"],
+                    row["location_precision"],
+                ),
+            ).fetchone()
+            for row in rows
+        ]
+
     points = []
-    for row in rows:
-        events = list_events({"ip": row["client_ip"], "limit": 1})
-        latest = events[0] if events else {}
+    for row, latest_row in zip(rows, latest_rows):
+        latest = row_to_event(latest_row) if latest_row else {}
         points.append(
             {
                 "id": latest.get("id", row["client_ip"]),
@@ -795,14 +1120,30 @@ def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
                 "asn": latest.get("asn"),
                 "ruleName": latest.get("ruleName"),
                 "throughputMb": round(max(4, int(row["count"]) * 0.42), 1),
+                "source": latest.get("source", "raw_events"),
+                "sourceType": "security_event" if latest else "raw_event",
+                "trafficKind": "attack" if latest.get("riskLevel", "info") != "info" else "visit",
             }
         )
     return points
 
 
+def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
+    security_points = get_raw_event_globe_points(min(limit, 10))
+    visit_limit = max(0, limit - len(security_points))
+    worker_visit_points = get_worker_log_country_globe_points(visit_limit)
+    remaining = max(0, visit_limit - len(worker_visit_points))
+    return [
+        *security_points,
+        *worker_visit_points,
+        *get_cloudflare_country_globe_points(remaining),
+    ]
+
+
 def aggregate_dimension_items(dimension: str, limit: int = 10) -> list[dict[str, Any]]:
-    prefix = "sample" if is_sample_mode() else "cloudflare"
-    if not dimension.startswith(f"{prefix}:"):
+    if is_sample_mode() and not dimension.startswith("sample:"):
+        return []
+    if not is_sample_mode() and not (dimension.startswith("cloudflare:") or dimension.startswith("worker_log:")):
         return []
     with db_session() as connection:
         rows = connection.execute(
@@ -852,7 +1193,7 @@ def get_overview() -> dict[str, Any]:
     top_agents = _ranked("user_agent", "event_type")
     countries = _ranked("country", "event_type")
     if not status_codes and not is_sample_mode():
-        status_codes = aggregate_dimension_items("cloudflare:status")
+        status_codes = aggregate_dimension_items(preferred_live_aggregate_dimension("status"))
         for item in status_codes:
             try:
                 code = int(item["label"])
@@ -863,9 +1204,11 @@ def get_overview() -> dict[str, Any]:
             elif code >= 400:
                 item["riskLevel"] = "medium"
     if not top_paths and not is_sample_mode():
-        top_paths = aggregate_ranked_items("cloudflare:path", "HTTP path")
-    if not countries and not is_sample_mode():
-        countries = aggregate_ranked_items("cloudflare:country", "Source country/region")
+        top_paths = aggregate_ranked_items(preferred_live_aggregate_dimension("path"), "HTTP path")
+    if not is_sample_mode():
+        aggregate_countries = aggregate_ranked_items(preferred_live_aggregate_dimension("country"), "Request distribution")
+        if aggregate_countries:
+            countries = aggregate_countries
     points = get_globe_points()
 
     total_24h = sum(point["requests"] for point in trend)

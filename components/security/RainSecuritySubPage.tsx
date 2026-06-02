@@ -12,6 +12,7 @@ import {
 } from "@/lib/security-api";
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
+import { resolveTrafficKind } from "@/lib/security-data";
 import type { PermissionCheck, RiskLevel, SecurityDataMode, SecurityEvent, SecurityRuleHit, SecuritySettings, SyncStatus } from "@/lib/security-data";
 
 export type EventInitialFilters = {
@@ -75,7 +76,7 @@ const riskText: Record<RiskLevel, string> = {
 };
 
 const riskOptions: Array<"all" | RiskLevel> = ["all", "info", "low", "medium", "high", "critical"];
-const actionOptions = ["all", "allow", "block", "challenge", "managed_challenge", "log"];
+const actionOptions = ["all", "allow", "block", "blocked", "challenge", "managed_challenge", "js_challenge", "log", "simulate"];
 const methodOptions = ["all", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
 const pageCopy = {
@@ -329,9 +330,20 @@ function toolSummary(event: SecurityEvent) {
   return event.toolSignature || event.userAgent || event.action;
 }
 
+function eventTrafficKind(event: SecurityEvent) {
+  return resolveTrafficKind(event);
+}
+
+function eventKindText(event: SecurityEvent) {
+  return eventTrafficKind(event) === "visit" ? "VISIT" : "ATTACK";
+}
+
+function eventDisplayCategory(event: SecurityEvent) {
+  return event.attackCategory || event.eventType;
+}
+
 function compactEventLine(event: SecurityEvent) {
-  const attack = event.attackCategory || event.eventType;
-  return `${event.method} ${event.path} / ${attack} / ${ruleHitSummary(event)}`;
+  return `${event.method} ${event.path} / ${eventKindText(event)}: ${eventDisplayCategory(event)} / ${ruleHitSummary(event)}`;
 }
 
 function RainEventConsole({
@@ -487,12 +499,13 @@ function RainEventConsole({
               type="button"
               className="rain-event-row"
               data-risk={event.riskLevel}
+              data-kind={eventTrafficKind(event)}
               data-active={selectedEvent?.id === event.id}
               style={{ "--row-delay": `${index * 28}ms` } as React.CSSProperties}
               onClick={() => setSelectedId(event.id)}
             >
               <span>{formatTime(event.timestamp)}</span>
-              <em>{riskText[event.riskLevel]}</em>
+              <em>{eventKindText(event)}</em>
               <strong>{event.clientIp}</strong>
               <small title={compactEventLine(event)}>{compactEventLine(event)}</small>
               <i title={`${event.action} / ${toolSummary(event)}`}>{toolSummary(event)}</i>
@@ -507,14 +520,14 @@ function RainEventConsole({
           <>
             <div className="rain-detail-heading">
               <span>FORENSIC DETAIL</span>
-              <strong>{selectedEvent.attackCategory || selectedEvent.eventType}</strong>
+              <strong>{eventKindText(selectedEvent)} / {eventDisplayCategory(selectedEvent)}</strong>
               <Link href={`/security/events/${encodeURIComponent(selectedEvent.id)}`}>PERMALINK</Link>
             </div>
             <div className="rain-detail-summary">{selectedEvent.summary}</div>
             <div className="rain-detail-grid">
               <HudMetric label="SOURCE" value={selectedEvent.clientIp} />
               <HudMetric label="AREA" value={`${selectedEvent.country} / ${selectedEvent.city || selectedEvent.region || "N/A"}`} />
-              <HudMetric label="ATTACK" value={selectedEvent.attackCategory || selectedEvent.eventType} />
+              <HudMetric label={eventTrafficKind(selectedEvent) === "visit" ? "VISIT" : "ATTACK"} value={eventDisplayCategory(selectedEvent)} />
               <HudMetric label="SUBTYPE" value={selectedEvent.attackSubtype || selectedEvent.eventType} />
               <HudMetric label="METHOD" value={selectedEvent.method} />
               <HudMetric label="STATUS" value={String(selectedEvent.statusCode)} />

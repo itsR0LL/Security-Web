@@ -1,0 +1,8 @@
+name = "security-log-worker"
+main = "src/index.js"
+compatibility_date = "2026-06-02"
+
+[[d1_databases]]
+binding = "SECURITY_LOG_DB"
+database_name = "security_studio_logs"
+database_id = "7b8e75df-ca27-438c-a60c-0486ca19fd12"

@@ -2970,6 +2970,7 @@
 
 .situation-region span,
 .situation-region em,
+.situation-region small,
 .situation-threat span,
 .situation-threat em,
 .situation-event span,
@@ -2994,6 +2995,22 @@
   font-weight: 1000;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.situation-region small {
+  grid-column: 2 / 4;
+  overflow: hidden;
+  color: rgba(232, 236, 234, 0.36);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.situation-region[data-risk="info"] em {
+  color: #8ee8ff;
+}
+
+.situation-region[data-risk="low"] em {
+  color: #b2f2bb;
 }
 
 .situation-region[data-risk="high"] em,
@@ -3026,6 +3043,15 @@
 .situation-threat[data-risk="medium"] em,
 .situation-event[data-risk="medium"] em {
   color: #ffd166;
+}
+
+.situation-threat-note span,
+.situation-threat-note em {
+  color: #8ee8ff;
+}
+
+.situation-event[data-kind="visit"] em {
+  color: #8ee8ff;
 }
 
 .situation-event {
@@ -3920,6 +3946,10 @@
 
 .rain-event-row[data-risk="medium"] em {
   color: #e6d18b;
+}
+
+.rain-event-row[data-kind="visit"] em {
+  color: #8ee8ff;
 }
 
 .rain-console-detail {

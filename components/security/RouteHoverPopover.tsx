@@ -2,6 +2,7 @@
 
 import type { CSSProperties } from "react";
 import type { GlobeRouteHover } from "@/components/security/ParticleGlobe";
+import { resolveTrafficKind } from "@/lib/security-data";
 
 type RouteHoverLayout = "home" | "situation";
 
@@ -86,6 +87,8 @@ export function RouteHoverPopover({ hover, layout = "home" }: RouteHoverPopoverP
     ? `${hover.point.throughputMb.toFixed(1)} MB`
     : `${Math.max(1, Math.round(hover.point.count * 0.42))} MB`;
   const hoverRouteLabel = `${hover.point.city || hover.point.country || hover.point.clientIp} -> Chengdu`;
+  const trafficKind = resolveTrafficKind(hover.point);
+  const isVisit = trafficKind === "visit";
 
   return (
     <div
@@ -96,21 +99,21 @@ export function RouteHoverPopover({ hover, layout = "home" }: RouteHoverPopoverP
       style={{ left: `${left}px`, top: `${top}px` } as CSSProperties}
     >
       <div className="rain-route-popover-inner">
-        <span className="rain-route-kicker">{hover.kind === "flight" ? "ROUTE TRACE" : "SOURCE TRACE"}</span>
+        <span className="rain-route-kicker">
+          {isVisit ? "VISIT TRACE" : hover.kind === "flight" ? "ROUTE TRACE" : "SOURCE TRACE"}
+        </span>
         <strong>{hoverRouteLabel}</strong>
         <div className="rain-route-meta">
-          <span>RISK</span>
-          <b>{hover.point.riskLevel.toUpperCase()}</b>
+          <span>TYPE</span>
+          <b>{isVisit ? "VISIT" : "ATTACK"}</b>
           <span>ACTION</span>
-          <b>{hover.point.action?.toUpperCase() ?? "LOG"}</b>
-          <span>REQ</span>
-          <b>
-            {hover.point.method ?? "GET"} / {hover.point.statusCode ?? "-"}
-          </b>
+          <b>{hover.point.action?.toUpperCase() ?? (isVisit ? "ALLOW" : "LOG")}</b>
+          <span>{isVisit ? "COUNT" : "REQ"}</span>
+          <b>{isVisit ? hover.point.count : `${hover.point.method ?? "GET"} / ${hover.point.statusCode ?? "-"}`}</b>
           <span>FLOW</span>
           <b>{hoverThroughput}</b>
         </div>
-        <p>{hover.point.path ?? hover.point.eventType}</p>
+        <p>{isVisit ? `${hover.point.country} request distribution` : hover.point.path ?? hover.point.eventType}</p>
       </div>
     </div>
   );

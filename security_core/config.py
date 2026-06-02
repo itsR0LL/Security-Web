@@ -29,3 +29,5 @@ DEFAULT_ALLOWED_ORIGINS = (
     "http://localhost:3001",
 )
 
+WORKER_LOG_EXPORT_URL = os.environ.get("SECURITY_WORKER_LOG_EXPORT_URL", "").strip()
+WORKER_LOG_EXPORT_TOKEN = os.environ.get("SECURITY_WORKER_LOG_EXPORT_TOKEN", "").strip()

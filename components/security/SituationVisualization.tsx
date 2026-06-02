@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ParticleGlobe } from "@/components/security/ParticleGlobe";
 import type { GlobeRouteHover } from "@/components/security/ParticleGlobe";
 import { RouteHoverPopover } from "@/components/security/RouteHoverPopover";
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
 import type { AnalysisSummary } from "@/lib/security-api";
-import type { RiskLevel, SecurityDataMode, SecurityOverview } from "@/lib/security-data";
+import { resolveTrafficKind } from "@/lib/security-data";
+import type { DistributionPoint, GlobePoint, RankedItem, RiskLevel, SecurityDataMode, SecurityEvent, SecurityOverview } from "@/lib/security-data";
 
 type ViewMode = "3d" | "2d";
 
@@ -30,6 +31,35 @@ const riskText: Record<RiskLevel, string> = {
   high: "HIGH",
   critical: "CRITICAL",
 };
+
+function riskRank(riskLevel: RiskLevel) {
+  if (riskLevel === "critical") return 4;
+  if (riskLevel === "high") return 3;
+  if (riskLevel === "medium") return 2;
+  if (riskLevel === "low") return 1;
+  return 0;
+}
+
+function regionVisitTone(index: number): RiskLevel {
+  if (index === 1) return "low";
+  if (index === 2) return "medium";
+  return "info";
+}
+
+function isAttackMixItem(item: DistributionPoint) {
+  return item.riskLevel ? riskRank(item.riskLevel) >= 2 : false;
+}
+
+function pointWithTrafficKind(point: GlobePoint): GlobePoint {
+  return {
+    ...point,
+    trafficKind: point.trafficKind ?? resolveTrafficKind(point),
+  };
+}
+
+function eventTrafficKind(event: SecurityEvent) {
+  return resolveTrafficKind(event);
+}
 
 function formatEventTime(timestamp: string) {
   const date = new Date(timestamp);
@@ -74,6 +104,16 @@ export function SituationVisualization({
   const mode = resolveSituationMode(source, error, overview);
   const status = mode.toUpperCase();
   const analysisText = analysisSummary?.summary || analysisSummary?.message;
+  const visualPoints = useMemo(() => overview.globePoints.map(pointWithTrafficKind), [overview.globePoints]);
+  const topRegions = useMemo(
+    () =>
+      overview.countries.slice(0, 4).map((country, index): RankedItem & { displayRisk: RiskLevel } => ({
+        ...country,
+        displayRisk: regionVisitTone(index),
+      })),
+    [overview.countries],
+  );
+  const attackMix = useMemo(() => overview.eventTypes.filter(isAttackMixItem).slice(0, 4), [overview.eventTypes]);
 
   return (
     <main className="rain-situation-page">
@@ -104,10 +144,10 @@ export function SituationVisualization({
         </button>
       </div>
 
-      <section className="situation-stage" data-view={view} aria-label={view === "3d" ? "3D 攻击态势" : "2D 请求分布"}>
+      <section className="situation-stage" data-view={view} aria-label={view === "3d" ? "3D 访问与攻击态势" : "2D 请求分布"}>
         <div className="situation-globe-stage">
           <ParticleGlobe
-            points={overview.globePoints}
+            points={visualPoints}
             projection={view === "2d" ? "map" : "globe"}
             controls
             onRouteHover={setRouteHover}
@@ -119,36 +159,48 @@ export function SituationVisualization({
       <aside className="situation-region-panel" aria-label="安全态势信息">
         <div className="situation-panel-section">
           <p>TOP REGIONS</p>
-          {overview.countries.slice(0, 4).map((country, index) => (
-            <div key={`${country.label}-${index}`} className="situation-region" data-risk={country.riskLevel ?? "info"}>
+          {topRegions.map((country, index) => (
+            <div key={`${country.label}-${index}`} className="situation-region" data-risk={country.displayRisk}>
               <span>{String(index + 1).padStart(2, "0")}</span>
               <strong>{country.label}</strong>
               <em>{formatCompact(country.value)}</em>
+              <small>{country.detail}</small>
             </div>
           ))}
         </div>
 
         <div className="situation-panel-section">
           <p>ATTACK MIX</p>
-          {overview.eventTypes
-            .filter((item) => item.riskLevel !== "info")
-            .slice(0, 4)
-            .map((item) => (
-              <div key={item.label} className="situation-threat" data-risk={item.riskLevel ?? "info"}>
-                <span>{riskText[item.riskLevel ?? "info"]}</span>
-                <strong>{item.label}</strong>
-                <em>{formatCompact(item.value)}</em>
-              </div>
-            ))}
+          {attackMix.map((item) => (
+            <div key={item.label} className="situation-threat" data-risk={item.riskLevel ?? "info"}>
+              <span>{riskText[item.riskLevel ?? "info"]}</span>
+              <strong>{item.label}</strong>
+              <em>{formatCompact(item.value)}</em>
+            </div>
+          ))}
+          {attackMix.length === 1 && (
+            <div className="situation-threat situation-threat-note" data-risk="info">
+              <span>STATE</span>
+              <strong>SINGLE ATTACK TYPE</strong>
+              <em>1</em>
+            </div>
+          )}
+          {attackMix.length === 0 && (
+            <div className="situation-threat situation-threat-note" data-risk="info">
+              <span>STATE</span>
+              <strong>NO ATTACK TYPE</strong>
+              <em>0</em>
+            </div>
+          )}
         </div>
 
         <div className="situation-panel-section situation-stream-section">
           <p>LIVE STREAM</p>
           {overview.recentEvents.slice(0, 4).map((event) => (
-            <div key={event.id} className="situation-event" data-risk={event.riskLevel}>
+            <div key={event.id} className="situation-event" data-risk={event.riskLevel} data-kind={eventTrafficKind(event)}>
               <span>{formatEventTime(event.timestamp)}</span>
               <strong>{event.city || event.country}</strong>
-              <em>{riskText[event.riskLevel]}</em>
+              <em>{eventTrafficKind(event) === "visit" ? "VISIT" : "ATTACK"}</em>
               <small>{event.path}</small>
             </div>
           ))}
