@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,6 +79,14 @@ SCHEMA_STATEMENTS = [
         confidence REAL NOT NULL DEFAULT 0,
         summary TEXT NOT NULL DEFAULT '',
         rule_matches_json TEXT NOT NULL DEFAULT '[]',
+        attack_category TEXT NOT NULL DEFAULT '',
+        attack_subtype TEXT NOT NULL DEFAULT '',
+        tool_signature TEXT NOT NULL DEFAULT '',
+        behavior_fingerprint TEXT NOT NULL DEFAULT '',
+        campaign_id TEXT NOT NULL DEFAULT '',
+        rule_hits_json TEXT NOT NULL DEFAULT '[]',
+        ai_cluster_id TEXT NOT NULL DEFAULT '',
+        rule_version TEXT NOT NULL DEFAULT '',
         raw_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL
     )
@@ -141,6 +150,13 @@ SCHEMA_STATEMENTS = [
         rule_type TEXT NOT NULL,
         condition_json TEXT NOT NULL DEFAULT '{}',
         severity TEXT NOT NULL DEFAULT 'medium',
+        version TEXT NOT NULL DEFAULT '1.0.0',
+        mode TEXT NOT NULL DEFAULT 'active',
+        attack_category TEXT NOT NULL DEFAULT '',
+        attack_subtype TEXT NOT NULL DEFAULT '',
+        tool_signature TEXT NOT NULL DEFAULT '',
+        behavior_fingerprint TEXT NOT NULL DEFAULT '',
+        rule_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -205,6 +221,98 @@ DEFAULT_RULES = [
 ]
 
 
+DEFAULT_RULE_VERSION = "2026.06.02"
+
+
+DEFAULT_RULE_DEFINITIONS = [
+    {
+        "id": "builtin-sensitive-path",
+        "name": "Sensitive path probe",
+        "rule_type": "path_keyword",
+        "condition": {"keywords": [".env", "wp-login.php", "phpmyadmin", "/admin"]},
+        "severity": "high",
+        "version": DEFAULT_RULE_VERSION,
+        "mode": "active",
+        "attack_category": "reconnaissance",
+        "attack_subtype": "sensitive_path_probe",
+        "tool_signature": "scanner_path_probe",
+        "behavior_fingerprint": "http_path_keyword_probe",
+    },
+    {
+        "id": "builtin-sqli",
+        "name": "SQL injection probe",
+        "rule_type": "query_keyword",
+        "condition": {"keywords": [" OR 1=1", "UNION SELECT", "--"]},
+        "severity": "high",
+        "version": DEFAULT_RULE_VERSION,
+        "mode": "active",
+        "attack_category": "injection",
+        "attack_subtype": "sql_injection_probe",
+        "tool_signature": "manual_or_scanner_sqli",
+        "behavior_fingerprint": "http_query_sqli_keyword",
+    },
+    {
+        "id": "builtin-xss",
+        "name": "XSS probe",
+        "rule_type": "query_keyword",
+        "condition": {"keywords": ["<script", "javascript:", "onerror="]},
+        "severity": "medium",
+        "version": DEFAULT_RULE_VERSION,
+        "mode": "active",
+        "attack_category": "injection",
+        "attack_subtype": "xss_probe",
+        "tool_signature": "manual_or_scanner_xss",
+        "behavior_fingerprint": "http_query_xss_keyword",
+    },
+    {
+        "id": "builtin-scanner-ua",
+        "name": "Scanner User-Agent",
+        "rule_type": "user_agent_keyword",
+        "condition": {"keywords": ["curl", "zgrab", "python-requests", "Go-http-client"]},
+        "severity": "medium",
+        "version": DEFAULT_RULE_VERSION,
+        "mode": "active",
+        "attack_category": "reconnaissance",
+        "attack_subtype": "scanner_user_agent",
+        "tool_signature": "scanner_user_agent",
+        "behavior_fingerprint": "http_user_agent_keyword",
+    },
+    {
+        "id": "builtin-cloudflare-action",
+        "name": "Cloudflare security action",
+        "rule_type": "cloudflare_action",
+        "condition": {"actions": ["block", "challenge", "managed_challenge"]},
+        "severity": "high",
+        "version": DEFAULT_RULE_VERSION,
+        "mode": "active",
+        "attack_category": "edge_security",
+        "attack_subtype": "cloudflare_action",
+        "tool_signature": "cloudflare_firewall",
+        "behavior_fingerprint": "cloudflare_action_match",
+    },
+]
+
+
+def versioned_rule_json(rule: dict[str, object]) -> str:
+    return json.dumps(
+        {
+            "id": rule["id"],
+            "version": rule["version"],
+            "mode": rule["mode"],
+            "ruleType": rule["rule_type"],
+            "condition": rule["condition"],
+            "severity": rule["severity"],
+            "classification": {
+                "attackCategory": rule["attack_category"],
+                "attackSubtype": rule["attack_subtype"],
+                "toolSignature": rule["tool_signature"],
+                "behaviorFingerprint": rule["behavior_fingerprint"],
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
 def _insert_default_state(connection: sqlite3.Connection) -> None:
     defaults = {
         "monitored_host": DEFAULT_MONITORED_HOST,
@@ -220,16 +328,94 @@ def _insert_default_state(connection: sqlite3.Connection) -> None:
         )
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _add_missing_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_sql_by_name: dict[str, str],
+) -> None:
+    existing_columns = _table_columns(connection, table_name)
+    for column_name, column_sql in column_sql_by_name.items():
+        if column_name not in existing_columns:
+            connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
+def _apply_schema_migrations(connection: sqlite3.Connection) -> None:
+    _add_missing_columns(
+        connection,
+        "raw_events",
+        {
+            "attack_category": "attack_category TEXT NOT NULL DEFAULT ''",
+            "attack_subtype": "attack_subtype TEXT NOT NULL DEFAULT ''",
+            "tool_signature": "tool_signature TEXT NOT NULL DEFAULT ''",
+            "behavior_fingerprint": "behavior_fingerprint TEXT NOT NULL DEFAULT ''",
+            "campaign_id": "campaign_id TEXT NOT NULL DEFAULT ''",
+            "rule_hits_json": "rule_hits_json TEXT NOT NULL DEFAULT '[]'",
+            "ai_cluster_id": "ai_cluster_id TEXT NOT NULL DEFAULT ''",
+            "rule_version": "rule_version TEXT NOT NULL DEFAULT ''",
+        },
+    )
+    _add_missing_columns(
+        connection,
+        "rules",
+        {
+            "version": "version TEXT NOT NULL DEFAULT '1.0.0'",
+            "mode": "mode TEXT NOT NULL DEFAULT 'active'",
+            "attack_category": "attack_category TEXT NOT NULL DEFAULT ''",
+            "attack_subtype": "attack_subtype TEXT NOT NULL DEFAULT ''",
+            "tool_signature": "tool_signature TEXT NOT NULL DEFAULT ''",
+            "behavior_fingerprint": "behavior_fingerprint TEXT NOT NULL DEFAULT ''",
+            "rule_json": "rule_json TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+
+
 def _insert_default_rules(connection: sqlite3.Connection) -> None:
     now = utc_now()
-    for rule_id, name, rule_type, condition_json, severity in DEFAULT_RULES:
+    for rule in DEFAULT_RULE_DEFINITIONS:
+        condition_json = json.dumps(rule["condition"], ensure_ascii=False)
+        rule_json = versioned_rule_json(rule)
         connection.execute(
             """
-            INSERT OR IGNORE INTO rules (
-                id, name, enabled, rule_type, condition_json, severity, created_at, updated_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+            INSERT INTO rules (
+                id, name, enabled, rule_type, condition_json, severity,
+                version, mode, attack_category, attack_subtype, tool_signature,
+                behavior_fingerprint, rule_json, created_at, updated_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                rule_type = excluded.rule_type,
+                condition_json = excluded.condition_json,
+                severity = excluded.severity,
+                version = excluded.version,
+                mode = excluded.mode,
+                attack_category = excluded.attack_category,
+                attack_subtype = excluded.attack_subtype,
+                tool_signature = excluded.tool_signature,
+                behavior_fingerprint = excluded.behavior_fingerprint,
+                rule_json = excluded.rule_json,
+                updated_at = excluded.updated_at
             """,
-            (rule_id, name, rule_type, condition_json, severity, now, now),
+            (
+                rule["id"],
+                rule["name"],
+                rule["rule_type"],
+                condition_json,
+                rule["severity"],
+                rule["version"],
+                rule["mode"],
+                rule["attack_category"],
+                rule["attack_subtype"],
+                rule["tool_signature"],
+                rule["behavior_fingerprint"],
+                rule_json,
+                now,
+                now,
+            ),
         )
 
 
@@ -238,6 +424,8 @@ def init_db() -> None:
     with db_session() as connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        _apply_schema_migrations(connection)
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_attack_category ON raw_events (attack_category)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_campaign ON raw_events (campaign_id)")
         _insert_default_state(connection)
         _insert_default_rules(connection)
-

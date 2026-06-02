@@ -14,6 +14,7 @@ from .config import (
     RISK_ORDER,
 )
 from .database import db_session, utc_now
+from .rule_matcher import apply_rule_matching, normalize_rule_row
 from .sample_data import create_sample_events, create_sample_traffic_trend
 
 
@@ -136,6 +137,14 @@ def event_to_row(event: dict[str, Any]) -> tuple[Any, ...]:
         float(event.get("confidence") or 0),
         event.get("summary", ""),
         json.dumps(event.get("ruleMatches", []), ensure_ascii=False),
+        event.get("attackCategory", ""),
+        event.get("attackSubtype", ""),
+        event.get("toolSignature", ""),
+        event.get("behaviorFingerprint", ""),
+        event.get("campaignId", ""),
+        json.dumps(event.get("ruleHits", []), ensure_ascii=False),
+        event.get("aiClusterId", ""),
+        event.get("ruleVersion", ""),
         json.dumps(raw, ensure_ascii=False),
         now,
     )
@@ -170,6 +179,14 @@ def row_to_event(row: Any) -> dict[str, Any]:
         "confidence": row["confidence"],
         "summary": row["summary"],
         "ruleMatches": _json_loads(row["rule_matches_json"], []),
+        "attackCategory": row["attack_category"],
+        "attackSubtype": row["attack_subtype"],
+        "toolSignature": row["tool_signature"],
+        "behaviorFingerprint": row["behavior_fingerprint"],
+        "campaignId": row["campaign_id"],
+        "ruleHits": _json_loads(row["rule_hits_json"], []),
+        "aiClusterId": row["ai_cluster_id"],
+        "ruleVersion": row["rule_version"],
         "raw": _sanitize_sensitive(_json_loads(row["raw_json"], {})),
     }
 
@@ -178,14 +195,19 @@ def insert_events(events: list[dict[str, Any]]) -> int:
     if not events:
         return 0
     with db_session() as connection:
+        rule_rows = connection.execute("SELECT * FROM rules ORDER BY id ASC").fetchall()
+        rules = [normalize_rule_row(row) for row in rule_rows]
+        matched_events = [apply_rule_matching(event, rules) for event in events]
         connection.executemany(
             """
             INSERT INTO raw_events (
                 id, source, event_id, occurred_at, client_ip, country, region, city,
                 latitude, longitude, location_precision, asn, method, host, path, query,
                 status_code, user_agent, referer, ray_id, action, rule_id, rule_name,
-                event_type, risk_level, confidence, summary, rule_matches_json, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_type, risk_level, confidence, summary, rule_matches_json,
+                attack_category, attack_subtype, tool_signature, behavior_fingerprint,
+                campaign_id, rule_hits_json, ai_cluster_id, rule_version, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 source = excluded.source,
                 event_id = excluded.event_id,
@@ -214,9 +236,17 @@ def insert_events(events: list[dict[str, Any]]) -> int:
                 confidence = excluded.confidence,
                 summary = excluded.summary,
                 rule_matches_json = excluded.rule_matches_json,
+                attack_category = excluded.attack_category,
+                attack_subtype = excluded.attack_subtype,
+                tool_signature = excluded.tool_signature,
+                behavior_fingerprint = excluded.behavior_fingerprint,
+                campaign_id = excluded.campaign_id,
+                rule_hits_json = excluded.rule_hits_json,
+                ai_cluster_id = excluded.ai_cluster_id,
+                rule_version = excluded.rule_version,
                 raw_json = excluded.raw_json
             """,
-            [event_to_row(event) for event in events],
+            [event_to_row(event) for event in matched_events],
         )
     return len(events)
 
@@ -833,19 +863,13 @@ def update_risk_threshold(level: str) -> None:
 def get_rules() -> list[dict[str, Any]]:
     with db_session() as connection:
         rows = connection.execute("SELECT * FROM rules ORDER BY id ASC").fetchall()
-    return [
-        {
-            "id": row["id"],
-            "name": row["name"],
-            "enabled": bool(row["enabled"]),
-            "ruleType": row["rule_type"],
-            "condition": _json_loads(row["condition_json"], {}),
-            "severity": row["severity"],
-            "createdAt": row["created_at"],
-            "updatedAt": row["updated_at"],
-        }
-        for row in rows
-    ]
+    rules = []
+    for row in rows:
+        rule = normalize_rule_row(row)
+        rule["createdAt"] = row["created_at"]
+        rule["updatedAt"] = row["updated_at"]
+        rules.append(rule)
+    return rules
 
 
 def source_summary() -> dict[str, Any]:

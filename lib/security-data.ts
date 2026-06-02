@@ -4,6 +4,17 @@ export type SyncStatusValue = "success" | "failed" | "partial" | "sample";
 
 export type LocationPrecision = "city" | "region" | "country" | "estimated";
 
+export type SecurityRuleHit = {
+  id: string;
+  name: string;
+  mode: string;
+  severity: RiskLevel | string;
+  classification: string;
+  evidence: string[];
+  confidence: number;
+  matched: boolean;
+};
+
 export type SecurityEvent = {
   id: string;
   timestamp: string;
@@ -32,6 +43,14 @@ export type SecurityEvent = {
   confidence: number;
   summary: string;
   ruleMatches: string[];
+  attackCategory?: string;
+  attackSubtype?: string;
+  toolSignature?: string;
+  behaviorFingerprint?: string;
+  campaignId?: string;
+  ruleHits?: SecurityRuleHit[];
+  aiClusterId?: string;
+  ruleVersion?: string;
   raw: Record<string, unknown>;
 };
 
@@ -186,6 +205,8 @@ function createEvent(
       destination,
       rayId: rest.rayId,
       matchedRules: rest.ruleMatches,
+      ruleHits: rest.ruleHits ?? [],
+      ruleVersion: rest.ruleVersion,
       cloudflareAction: rest.action,
     },
   };
@@ -217,6 +238,35 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.96,
       summary: "来源 IP 请求 .env 并被 Cloudflare 拦截。",
       ruleMatches: ["路径命中 .env", "Cloudflare block", "扫描器 User-Agent"],
+      attackCategory: "敏感信息探测",
+      attackSubtype: ".env 配置文件探测",
+      toolSignature: "curl/8.2 / 命令行扫描器",
+      behaviorFingerprint: "短时间直接访问敏感根路径，User-Agent 暴露自动化工具特征。",
+      campaignId: "campaign-sensitive-path-001",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-sensitive-path",
+      ruleHits: [
+        {
+          id: "builtin-sensitive-path",
+          name: "敏感路径探测",
+          mode: "enforce",
+          severity: "critical",
+          classification: "sensitive_path",
+          evidence: ["path=/.env", "action=block", "userAgent=curl/8.2 security scanner"],
+          confidence: 0.96,
+          matched: true,
+        },
+        {
+          id: "shadow-tool-curl",
+          name: "命令行工具指纹",
+          mode: "shadow",
+          severity: "medium",
+          classification: "tool_signature",
+          evidence: ["userAgent contains curl"],
+          confidence: 0.82,
+          matched: false,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1008",
@@ -243,6 +293,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.88,
       summary: "查询参数包含典型 SQL 注入片段，已触发挑战。",
       ruleMatches: ["SQL 关键词", "POST 请求", "Cloudflare managed_challenge"],
+      attackCategory: "注入攻击",
+      attackSubtype: "SQL 布尔绕过探测",
+      toolSignature: "Browser UA / 手工注入片段",
+      behaviorFingerprint: "POST 查询接口携带 `' OR 1=1--` 注入语句并触发托管挑战。",
+      campaignId: "campaign-injection-001",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-sqli",
+      ruleHits: [
+        {
+          id: "builtin-sqli",
+          name: "疑似 SQL 注入",
+          mode: "enforce",
+          severity: "high",
+          classification: "sql_injection",
+          evidence: ["query=q=' OR 1=1--", "method=POST", "action=managed_challenge"],
+          confidence: 0.88,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1007",
@@ -268,6 +337,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.91,
       summary: "非 WordPress 站点出现 wp-login.php 探测请求。",
       ruleMatches: ["敏感路径 wp-login.php", "可疑 User-Agent"],
+      attackCategory: "目录探测",
+      attackSubtype: "WordPress 登录入口探测",
+      toolSignature: "zgrab/0.x / 互联网资产探测器",
+      behaviorFingerprint: "访问不存在的 WordPress 登录路径，User-Agent 指向 zgrab 扫描器。",
+      campaignId: "campaign-cms-probe-001",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-cms-probe",
+      ruleHits: [
+        {
+          id: "builtin-wp-probe",
+          name: "WordPress 探测",
+          mode: "enforce",
+          severity: "high",
+          classification: "cms_probe",
+          evidence: ["path=/wp-login.php", "statusCode=404", "userAgent contains zgrab"],
+          confidence: 0.91,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1006",
@@ -293,6 +381,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.84,
       summary: "后台路径被连续探测，Cloudflare 已执行 block。",
       ruleMatches: ["路径 /admin", "Cloudflare block"],
+      attackCategory: "后台探测",
+      attackSubtype: "管理入口枚举",
+      toolSignature: "python-requests/2.31 / 自动化请求库",
+      behaviorFingerprint: "自动化请求库直接访问后台路径，并触发阻断动作。",
+      campaignId: "campaign-admin-probe-001",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-admin-probe",
+      ruleHits: [
+        {
+          id: "builtin-admin-probe",
+          name: "后台路径探测",
+          mode: "enforce",
+          severity: "high",
+          classification: "admin_probe",
+          evidence: ["path=/admin", "action=block", "userAgent=python-requests/2.31"],
+          confidence: 0.84,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1005",
@@ -318,6 +425,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.64,
       summary: "公开文章访问，请求行为正常。",
       ruleMatches: ["缓存命中", "状态码 200"],
+      attackCategory: "正常访问",
+      attackSubtype: "公开内容访问",
+      toolSignature: "Browser UA / 常规浏览器",
+      behaviorFingerprint: "浏览器访问公开文章，状态码与行为均在正常范围内。",
+      campaignId: "campaign-benign-traffic",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-benign",
+      ruleHits: [
+        {
+          id: "traffic-normal",
+          name: "普通访问",
+          mode: "observe",
+          severity: "info",
+          classification: "benign_traffic",
+          evidence: ["path=/posts/first", "statusCode=200", "action=allow"],
+          confidence: 0.64,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1004",
@@ -343,6 +469,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.9,
       summary: "phpMyAdmin 路径探测触发挑战。",
       ruleMatches: ["路径 phpmyadmin", "可疑 User-Agent"],
+      attackCategory: "敏感信息探测",
+      attackSubtype: "phpMyAdmin 入口探测",
+      toolSignature: "Go-http-client/1.1 / 自动化 HTTP 客户端",
+      behaviorFingerprint: "自动化客户端访问常见数据库管理入口，目标路径返回 404 后触发挑战。",
+      campaignId: "campaign-sensitive-path-001",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-sensitive-path",
+      ruleHits: [
+        {
+          id: "builtin-sensitive-path",
+          name: "敏感路径探测",
+          mode: "enforce",
+          severity: "high",
+          classification: "sensitive_path",
+          evidence: ["path=/phpmyadmin/index.php", "statusCode=404", "userAgent=Go-http-client/1.1"],
+          confidence: 0.9,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1003",
@@ -369,6 +514,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.79,
       summary: "评论接口参数包含 script 片段，已触发托管挑战。",
       ruleMatches: ["XSS 关键词", "Cloudflare managed_challenge"],
+      attackCategory: "注入攻击",
+      attackSubtype: "反射型 XSS 探测",
+      toolSignature: "Browser UA / 参数注入片段",
+      behaviorFingerprint: "评论接口参数包含 script 标签片段，并触发托管挑战。",
+      campaignId: "campaign-injection-002",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-xss",
+      ruleHits: [
+        {
+          id: "builtin-xss",
+          name: "疑似 XSS",
+          mode: "enforce",
+          severity: "medium",
+          classification: "xss",
+          evidence: ["query contains <script>", "path=/api/comment", "action=managed_challenge"],
+          confidence: 0.79,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1002",
@@ -394,6 +558,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.58,
       summary: "订阅抓取行为，暂不构成威胁。",
       ruleMatches: ["已知爬虫 User-Agent"],
+      attackCategory: "爬虫访问",
+      attackSubtype: "已知订阅抓取",
+      toolSignature: "FeedFetcher-Google / 已知爬虫",
+      behaviorFingerprint: "已知订阅抓取器访问 RSS 路径，允许通过。",
+      campaignId: "campaign-known-crawler",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-crawler",
+      ruleHits: [
+        {
+          id: "crawler-known",
+          name: "已知爬虫",
+          mode: "observe",
+          severity: "low",
+          classification: "known_crawler",
+          evidence: ["userAgent=FeedFetcher-Google", "path=/rss.xml", "action=allow"],
+          confidence: 0.58,
+          matched: true,
+        },
+      ],
     }),
     createEvent(now, {
       id: "evt-1001",
@@ -419,6 +602,25 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
       confidence: 0.7,
       summary: "站点可用性探测，请求正常。",
       ruleMatches: ["HEAD 请求", "状态码 200"],
+      attackCategory: "正常访问",
+      attackSubtype: "可用性检测",
+      toolSignature: "UptimeRobot/2.0 / 监控探针",
+      behaviorFingerprint: "监控探针使用 HEAD 请求检查站点可用性。",
+      campaignId: "campaign-availability-check",
+      ruleVersion: "ruleset-2026.06.02",
+      aiClusterId: "cluster-benign",
+      ruleHits: [
+        {
+          id: "monitor-normal",
+          name: "可用性检测",
+          mode: "observe",
+          severity: "info",
+          classification: "availability_check",
+          evidence: ["method=HEAD", "statusCode=200", "action=allow"],
+          confidence: 0.7,
+          matched: true,
+        },
+      ],
     }),
   ];
 

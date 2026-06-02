@@ -12,7 +12,7 @@ import {
 } from "@/lib/security-api";
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
-import type { PermissionCheck, RiskLevel, SecurityEvent, SecuritySettings } from "@/lib/security-data";
+import type { PermissionCheck, RiskLevel, SecurityEvent, SecurityRuleHit, SecuritySettings } from "@/lib/security-data";
 
 export type EventInitialFilters = {
   risk?: string;
@@ -215,6 +215,77 @@ Open: /security/events/${event.id}`
   );
 }
 
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function normalizeRuleHit(hit: SecurityRuleHit | Record<string, unknown>, event: SecurityEvent, fallbackEvidence: string[]): SecurityRuleHit {
+  const raw = hit as Record<string, unknown>;
+  const mode = stringValue(raw.mode) || "observe";
+  const matchedField = stringValue(raw.matchedField);
+  const matchedValue = stringValue(raw.matchedValue);
+  const evidence = stringArray(raw.evidence);
+  const generatedEvidence = matchedField || matchedValue ? [`${matchedField || "field"}=${matchedValue || "matched"}`] : fallbackEvidence;
+  const classification =
+    stringValue(raw.classification) ||
+    [stringValue(raw.attackCategory), stringValue(raw.attackSubtype)].filter(Boolean).join(" / ") ||
+    event.eventType;
+
+  return {
+    id: stringValue(raw.id) || stringValue(raw.ruleId) || event.ruleId || "unmapped-rule",
+    name: stringValue(raw.name) || stringValue(raw.ruleName) || event.ruleName || "Unmapped rule",
+    mode,
+    severity: stringValue(raw.severity) || event.riskLevel,
+    classification,
+    evidence: evidence.length ? evidence : generatedEvidence,
+    confidence: typeof raw.confidence === "number" ? raw.confidence : event.confidence,
+    matched: typeof raw.matched === "boolean" ? raw.matched : mode !== "shadow",
+  };
+}
+
+function eventRuleHits(event: SecurityEvent): SecurityRuleHit[] {
+  const ruleMatches = Array.isArray(event.ruleMatches) ? event.ruleMatches : [];
+  if (event.ruleHits?.length) return event.ruleHits.map((hit) => normalizeRuleHit(hit, event, ruleMatches));
+  if (ruleMatches.length === 0 && !event.ruleId && !event.ruleName) return [];
+  return [
+    {
+      id: event.ruleId || "unmapped-rule",
+      name: event.ruleName || "Unmapped rule",
+      mode: "observe",
+      severity: event.riskLevel,
+      classification: event.eventType,
+      evidence: ruleMatches,
+      confidence: event.confidence,
+      matched: true,
+    },
+  ];
+}
+
+function primaryRuleHit(event: SecurityEvent) {
+  const hits = eventRuleHits(event);
+  return hits.find((hit) => hit.matched) ?? hits[0] ?? null;
+}
+
+function ruleHitSummary(event: SecurityEvent) {
+  const hits = eventRuleHits(event);
+  const primary = hits.find((hit) => hit.matched) ?? hits[0];
+  if (!primary) return "NO RULE";
+  return hits.length > 1 ? `${hits.length} RULES / ${primary.name}` : primary.name;
+}
+
+function toolSummary(event: SecurityEvent) {
+  return event.toolSignature || event.userAgent || event.action;
+}
+
+function compactEventLine(event: SecurityEvent) {
+  const attack = event.attackCategory || event.eventType;
+  return `${event.method} ${event.path} / ${attack} / ${ruleHitSummary(event)}`;
+}
+
 function RainEventConsole({
   events,
   initialFilters,
@@ -237,6 +308,8 @@ function RainEventConsole({
     [events, filters],
   );
   const selectedEvent = visibleEvents.find((event) => event.id === selectedId) ?? visibleEvents[0] ?? null;
+  const selectedRuleHits = selectedEvent ? eventRuleHits(selectedEvent) : [];
+  const selectedPrimaryRule = selectedEvent ? primaryRuleHit(selectedEvent) : null;
   const highCount = visibleEvents.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length;
   const blockedCount = visibleEvents.filter((event) => event.action === "block" || event.action === "managed_challenge").length;
 
@@ -365,10 +438,8 @@ function RainEventConsole({
               <span>{formatTime(event.timestamp)}</span>
               <em>{riskText[event.riskLevel]}</em>
               <strong>{event.clientIp}</strong>
-              <small>
-                {event.method} {event.path}
-              </small>
-              <i>{event.action}</i>
+              <small title={compactEventLine(event)}>{compactEventLine(event)}</small>
+              <i title={`${event.action} / ${toolSummary(event)}`}>{toolSummary(event)}</i>
             </button>
           ))}
           {visibleEvents.length === 0 && <div className="rain-console-empty">NO MATCHED EVENT</div>}
@@ -380,26 +451,41 @@ function RainEventConsole({
           <>
             <div className="rain-detail-heading">
               <span>FORENSIC DETAIL</span>
-              <strong>{selectedEvent.eventType}</strong>
+              <strong>{selectedEvent.attackCategory || selectedEvent.eventType}</strong>
               <Link href={`/security/events/${encodeURIComponent(selectedEvent.id)}`}>PERMALINK</Link>
             </div>
             <div className="rain-detail-summary">{selectedEvent.summary}</div>
             <div className="rain-detail-grid">
               <HudMetric label="SOURCE" value={selectedEvent.clientIp} />
               <HudMetric label="AREA" value={`${selectedEvent.country} / ${selectedEvent.city || selectedEvent.region || "N/A"}`} />
+              <HudMetric label="ATTACK" value={selectedEvent.attackCategory || selectedEvent.eventType} />
+              <HudMetric label="SUBTYPE" value={selectedEvent.attackSubtype || selectedEvent.eventType} />
               <HudMetric label="METHOD" value={selectedEvent.method} />
               <HudMetric label="STATUS" value={String(selectedEvent.statusCode)} />
               <HudMetric label="ACTION" value={selectedEvent.action} />
               <HudMetric label="RISK" value={riskText[selectedEvent.riskLevel]} />
               <HudMetric label="RAY" value={selectedEvent.rayId || "N/A"} />
               <HudMetric label="CONF" value={`${Math.round(selectedEvent.confidence * 100)}%`} />
+              <HudMetric label="RULES" value={String(selectedRuleHits.length)} />
+              <HudMetric label="VERSION" value={selectedEvent.ruleVersion || "N/A"} />
+            </div>
+            <div className="rain-template-block">
+              <span>TOOL SIGNATURE</span>
+              <p>{selectedEvent.toolSignature || selectedEvent.userAgent || "N/A"}</p>
+              <p>{selectedEvent.behaviorFingerprint || "No behavior fingerprint in current event payload."}</p>
+              <p>Campaign: {selectedEvent.campaignId || "N/A"}</p>
             </div>
             <div className="rain-rule-list">
               <span>RULE HITS</span>
-              {selectedEvent.ruleMatches.map((rule) => (
-                <small key={rule}>{rule}</small>
+              {selectedRuleHits.map((rule) => (
+                <small key={`${rule.id}:${rule.mode}:${rule.classification}`}>
+                  {rule.matched ? "MATCHED" : "SHADOW"} / {rule.id} / {rule.name} / {rule.mode} / {rule.severity} / {rule.classification} /{" "}
+                  {Math.round(rule.confidence * 100)}%
+                  {Array.isArray(rule.evidence) && rule.evidence.length > 0 ? ` / evidence: ${rule.evidence.join(" | ")}` : ""}
+                </small>
               ))}
-              {selectedEvent.ruleMatches.length === 0 && <small>Cloudflare did not return matched rule details.</small>}
+              {selectedRuleHits.length === 0 && <small>Cloudflare did not return matched rule details.</small>}
+              {selectedPrimaryRule && <small>PRIMARY / {selectedPrimaryRule.id} / {selectedPrimaryRule.name}</small>}
             </div>
             <div className="rain-template-block">
               <span>AI ANALYSIS / RESERVED</span>

@@ -2,6 +2,7 @@ import {
   createSampleSecurityData,
   type SecurityEvent,
   type SecurityOverview,
+  type SecurityRuleHit,
   type SecuritySettings,
   type RiskLevel,
 } from "./security-data";
@@ -206,6 +207,68 @@ function filterSampleEvents(query: SecurityEventQuery = {}) {
     .slice(offset, offset + limit);
 }
 
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function normalizeRuleHit(hit: SecurityRuleHit | Record<string, unknown>, event: SecurityEvent, fallbackEvidence: string[]): SecurityRuleHit {
+  const raw = hit as Record<string, unknown>;
+  const mode = stringValue(raw.mode) || "observe";
+  const matchedField = stringValue(raw.matchedField);
+  const matchedValue = stringValue(raw.matchedValue);
+  const evidence = stringArray(raw.evidence);
+  const generatedEvidence = matchedField || matchedValue ? [`${matchedField || "field"}=${matchedValue || "matched"}`] : fallbackEvidence;
+  const classification =
+    stringValue(raw.classification) ||
+    [stringValue(raw.attackCategory), stringValue(raw.attackSubtype)].filter(Boolean).join(" / ") ||
+    event.eventType;
+
+  return {
+    id: stringValue(raw.id) || stringValue(raw.ruleId) || event.ruleId || "unmapped-rule",
+    name: stringValue(raw.name) || stringValue(raw.ruleName) || event.ruleName || "Unmapped rule",
+    mode,
+    severity: stringValue(raw.severity) || event.riskLevel,
+    classification,
+    evidence: evidence.length ? evidence : generatedEvidence,
+    confidence: typeof raw.confidence === "number" ? raw.confidence : event.confidence,
+    matched: typeof raw.matched === "boolean" ? raw.matched : mode !== "shadow",
+  };
+}
+
+function normalizeRuleHits(event: SecurityEvent): SecurityRuleHit[] {
+  const ruleMatches = Array.isArray(event.ruleMatches) ? event.ruleMatches : [];
+  if (event.ruleHits?.length) return event.ruleHits.map((hit) => normalizeRuleHit(hit, event, ruleMatches));
+  if (!event.ruleId && !event.ruleName && ruleMatches.length === 0) return [];
+  return [
+    {
+      id: event.ruleId || "unmapped-rule",
+      name: event.ruleName || "Unmapped rule",
+      mode: "observe",
+      severity: event.riskLevel,
+      classification: event.eventType,
+      evidence: ruleMatches,
+      confidence: event.confidence,
+      matched: true,
+    },
+  ];
+}
+
+function normalizeSecurityEvent(event: SecurityEvent): SecurityEvent {
+  return {
+    ...event,
+    attackCategory: event.attackCategory || event.eventType,
+    attackSubtype: event.attackSubtype || event.eventType,
+    toolSignature: event.toolSignature || event.userAgent,
+    behaviorFingerprint: event.behaviorFingerprint || event.summary,
+    ruleVersion: event.ruleVersion || "unversioned",
+    ruleHits: normalizeRuleHits(event),
+  };
+}
+
 export async function getSecurityOverview(): Promise<SecurityApiResult<SecurityOverview>> {
   return fetchWithFallback("/api/overview", createSampleSecurityData().overview);
 }
@@ -213,12 +276,20 @@ export async function getSecurityOverview(): Promise<SecurityApiResult<SecurityO
 export async function getSecurityEvents(query: SecurityEventQuery = {}): Promise<SecurityApiResult<SecurityEvent[]>> {
   const search = queryToParams(query);
   const path = search ? `/api/events?${search}` : "/api/events";
-  return fetchWithFallback(path, filterSampleEvents(query));
+  const result = await fetchWithFallback(path, filterSampleEvents(query));
+  return {
+    ...result,
+    data: result.data.map(normalizeSecurityEvent),
+  };
 }
 
 export async function getSecurityEvent(id: string): Promise<SecurityApiResult<SecurityEvent | null>> {
   const fallback = createSampleSecurityData().events.find((event) => event.id === id) ?? null;
-  return fetchWithFallback(`/api/events/${encodeURIComponent(id)}`, fallback);
+  const result = await fetchWithFallback(`/api/events/${encodeURIComponent(id)}`, fallback);
+  return {
+    ...result,
+    data: result.data ? normalizeSecurityEvent(result.data) : null,
+  };
 }
 
 export async function getSecuritySettings(): Promise<SecurityApiResult<SecuritySettings>> {
