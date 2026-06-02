@@ -8,12 +8,17 @@ from typing import Any
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
+from .cloudflare_client import CloudflareClient, CloudflareClientError
 from .config import DEFAULT_ALLOWED_ORIGINS
 from .database import init_db, utc_now
+from .event_normalizer import build_http_aggregate_rows, normalize_security_events
 from .repository import (
     count_events,
+    create_sync_run,
     get_cloudflare_token,
+    get_cloudflare_zone_id,
     get_event,
+    get_monitored_host,
     get_overview,
     get_rules,
     get_settings,
@@ -24,6 +29,8 @@ from .repository import (
     map_payload,
     normalize_event_limit,
     normalize_event_offset,
+    replace_cloudflare_aggregates,
+    replace_cloudflare_events,
     seed_sample_dataset,
     source_summary,
     update_cloudflare_settings,
@@ -42,20 +49,27 @@ def token_check_state(check: dict[str, Any], *, sample_mode: bool = False) -> di
             "mode": "sample",
             "status": "sample",
             "cloudflareLive": False,
-            "message": "未配置 Cloudflare Token，当前保持样例数据模式。",
+            "message": "Cloudflare Token is not configured. Sample data mode is active.",
         }
     if check["status"] == "success":
         return {
-            "mode": "mock",
-            "status": "mock",
-            "cloudflareLive": False,
-            "message": "Token 仅通过本地结构校验，MVP 阶段尚未调用 Cloudflare。",
+            "mode": "live",
+            "status": "success",
+            "cloudflareLive": True,
+            "message": "Cloudflare GraphQL access verified.",
+        }
+    if check["status"] == "degraded":
+        return {
+            "mode": "degraded",
+            "status": "degraded",
+            "cloudflareLive": True,
+            "message": check.get("errorMessage") or "Cloudflare GraphQL access is partially available.",
         }
     return {
         "mode": "degraded",
         "status": "degraded",
         "cloudflareLive": False,
-        "message": check.get("errorMessage") or "Token 配置未通过本地校验。",
+        "message": check.get("errorMessage") or "Cloudflare token check failed.",
     }
 
 
@@ -220,7 +234,8 @@ def sync_status() -> dict[str, Any]:
 
 @app.post("/api/sync/run")
 def sync_run() -> dict[str, Any]:
-    if not get_cloudflare_token():
+    token = get_cloudflare_token()
+    if not token:
         result = seed_sample_dataset("sample")
         return api_success(
             {
@@ -229,42 +244,81 @@ def sync_run() -> dict[str, Any]:
                 "cloudflareLive": False,
                 "usedStaleData": False,
                 **result,
-                "message": "未配置 Cloudflare Token，已刷新样例数据。",
+                "message": "Cloudflare Token is not configured. Sample data was refreshed.",
             }
         )
 
     check = check_cloudflare_token(persist=True)
-    if check["status"] != "success":
-        from .repository import create_sync_run
-
+    if not check["zoneRead"] or not check["analyticsRead"]:
         create_sync_run(status="failed", error_message=check["errorMessage"], used_stale_data=True)
         return api_success(
             {
-                "mode": "degraded",
+                "mode": "stale",
                 "status": "stale",
                 "cloudflareLive": False,
                 "usedStaleData": True,
-                "message": "Token 配置未通过本地校验，同步未执行，继续保留旧数据。",
+                "message": "Cloudflare sync was not executed. Existing data was kept.",
                 "tokenCheck": check,
             }
         )
 
-    result = seed_sample_dataset(
-        "cloudflare",
-        sync_status="partial",
-        error_message="MVP 阶段未调用 Cloudflare，当前为结构等价的 mock 同步数据。",
-        used_stale_data=False,
+    client = CloudflareClient()
+    try:
+        fetched = client.fetch_zone_data(zone_id=get_cloudflare_zone_id(), token=token, host=get_monitored_host(), hours=24)
+    except CloudflareClientError as error:
+        create_sync_run(status="failed", error_message=str(error), used_stale_data=True)
+        return api_success(
+            {
+                "mode": "stale",
+                "status": "stale",
+                "cloudflareLive": False,
+                "usedStaleData": True,
+                "message": "Cloudflare sync failed. Existing data was kept.",
+                "errorType": error.error_type,
+                "tokenCheck": check,
+            }
+        )
+
+    aggregate_rows = build_http_aggregate_rows(fetched.http_analytics, fetched.from_time)
+    aggregate_count = replace_cloudflare_aggregates(aggregate_rows)
+    event_count = 0
+    used_stale_data = False
+    if fetched.security_events_read:
+        events_data = normalize_security_events(fetched.security_events)
+        event_count = replace_cloudflare_events(events_data)
+    else:
+        used_stale_data = True
+
+    status_value = "success" if fetched.security_events_read else "degraded"
+    error_message = None
+    if fetched.degraded_reasons:
+        error_message = "Cloudflare Security Events are unavailable. HTTP analytics were synced."
+    create_sync_run(
+        status=status_value,
+        event_count=event_count,
+        aggregate_count=aggregate_count,
+        error_message=error_message,
+        used_stale_data=used_stale_data,
+        from_time=fetched.from_time,
+        to_time=fetched.to_time,
     )
     return api_success(
         {
-            "mode": "mock",
-            "status": "mock",
-            "syncStatus": "partial",
-            "cloudflareLive": False,
-            "usedStaleData": False,
+            "mode": "live" if status_value == "success" else "degraded",
+            "status": status_value,
+            "syncStatus": status_value,
+            "cloudflareLive": True,
+            "httpAnalyticsLive": fetched.analytics_read,
+            "securityEventsLive": fetched.security_events_read,
+            "usedStaleData": used_stale_data,
+            "events": event_count,
+            "aggregates": aggregate_count,
+            "monitoredHost": get_monitored_host(),
+            "degradedReasons": fetched.degraded_reasons,
+            "fromTime": fetched.from_time,
+            "toTime": fetched.to_time,
             "tokenCheck": check,
-            **result,
-            "message": "MVP 阶段尚未调用 Cloudflare，已写入结构等价的模拟同步数据。",
+            "message": error_message or "Cloudflare GraphQL data synced.",
         }
     )
 
@@ -313,3 +367,22 @@ def save_risk_threshold(payload: dict[str, Any] | None = Body(default=None)) -> 
 @app.get("/api/rules")
 def rules() -> dict[str, Any]:
     return api_success(get_rules())
+
+
+@app.get("/api/analysis/summary")
+def analysis_summary() -> dict[str, Any]:
+    overview_data = get_overview()
+    sync = overview_data["sync"]
+    return api_success(
+        {
+            "status": "reserved",
+            "message": "AI analysis is reserved. Current summary is generated from rule matching and Cloudflare aggregates.",
+            "generatedAt": overview_data["generatedAt"],
+            "items": [
+                {"label": "mode", "value": sync.get("mode") or sync.get("status"), "detail": "Current data source mode"},
+                {"label": "events", "value": sync["localEventCount"], "detail": "Stored event rows"},
+                {"label": "aggregates", "value": sync["aggregateCount"], "detail": "Stored aggregate rows"},
+                {"label": "sources", "value": len(overview_data["globePoints"]), "detail": "Visible source points"},
+            ],
+        }
+    )

@@ -1,6 +1,8 @@
 export type RiskLevel = "info" | "low" | "medium" | "high" | "critical";
 
-export type SyncStatusValue = "success" | "failed" | "partial" | "sample";
+export type SyncStatusValue = "success" | "failed" | "partial" | "sample" | "degraded" | "stale";
+
+export type SecurityDataMode = "live" | "degraded" | "stale" | "mock" | "mock-cloudflare" | "sample";
 
 export type LocationPrecision = "city" | "region" | "country" | "estimated";
 
@@ -117,6 +119,8 @@ export type PermissionCheck = {
 
 export type SyncStatus = {
   status: SyncStatusValue;
+  mode?: SecurityDataMode;
+  cloudflareLive?: boolean;
   lastSyncAt: string;
   lastSuccessAt: string;
   usedStaleData: boolean;

@@ -291,6 +291,58 @@ def seed_traffic_aggregates(source: str = "sample") -> int:
     return len(trend)
 
 
+def insert_aggregate_rows(rows: list[dict[str, Any]], *, source: str = "cloudflare") -> int:
+    if not rows:
+        return 0
+    created_at = utc_now()
+    with db_session() as connection:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO event_aggregates (
+                id, bucket_type, bucket_start, dimension, dimension_value,
+                total_count, threat_count, blocked_count, challenge_count,
+                bandwidth_bytes, cached_bytes, origin_bytes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["id"],
+                    row.get("bucket_type", "range"),
+                    row.get("bucket_start", utc_now()),
+                    row["dimension"],
+                    row.get("dimension_value", "all"),
+                    int(row.get("total_count") or 0),
+                    int(row.get("threat_count") or 0),
+                    int(row.get("blocked_count") or 0),
+                    int(row.get("challenge_count") or 0),
+                    int(row.get("bandwidth_bytes") or 0),
+                    int(row.get("cached_bytes") or 0),
+                    int(row.get("origin_bytes") or 0),
+                    created_at,
+                )
+                for row in rows
+                if str(row.get("dimension") or "").startswith(f"{source}:")
+            ],
+        )
+    return len([row for row in rows if str(row.get("dimension") or "").startswith(f"{source}:")])
+
+
+def clear_cloudflare_aggregates() -> None:
+    with db_session() as connection:
+        connection.execute("DELETE FROM event_aggregates WHERE dimension LIKE 'cloudflare:%'")
+
+
+def replace_cloudflare_events(events: list[dict[str, Any]]) -> int:
+    with db_session() as connection:
+        connection.execute("DELETE FROM raw_events WHERE source = 'cloudflare'")
+    return insert_events(events)
+
+
+def replace_cloudflare_aggregates(rows: list[dict[str, Any]]) -> int:
+    clear_cloudflare_aggregates()
+    return insert_aggregate_rows(rows, source="cloudflare")
+
+
 def seed_sample_dataset(
     source: str = "sample",
     *,
@@ -410,6 +462,15 @@ def permissions_from_token_check(check: dict[str, Any] | None) -> list[dict[str,
             {"name": "Analytics Read", "ok": False, "detail": "等待配置 Token"},
             {"name": "Security Events Read", "ok": False, "detail": "等待配置 Token"},
         ]
+    details = check.get("details") or {}
+    network_request = bool(details.get("networkRequest"))
+    error_message = check.get("errorMessage") or "权限检测未通过"
+    if network_request:
+        return [
+            {"name": "Zone Read", "ok": bool(check["zoneRead"]), "detail": "Cloudflare Zone access verified." if check["zoneRead"] else error_message},
+            {"name": "Analytics Read", "ok": bool(check["analyticsRead"]), "detail": "Cloudflare HTTP Analytics access verified." if check["analyticsRead"] else error_message},
+            {"name": "Security Events Read", "ok": bool(check["securityEventsRead"]), "detail": "Cloudflare Security Events access verified." if check["securityEventsRead"] else error_message},
+        ]
     return [
         {"name": "Zone Read", "ok": bool(check["zoneRead"]), "detail": "Zone ID 格式已通过本地校验" if check["zoneRead"] else "Zone ID 缺失或格式异常"},
         {"name": "Analytics Read", "ok": bool(check["analyticsRead"]), "detail": "Token 格式允许读取 Analytics" if check["analyticsRead"] else "Token 缺失或格式异常"},
@@ -435,8 +496,10 @@ def get_sync_status() -> dict[str, Any]:
         used_stale = False
     if sample:
         mode = "sample"
+    elif status == "degraded":
+        mode = "degraded"
     elif status == "partial":
-        mode = "mock"
+        mode = "degraded"
     elif status == "failed" and used_stale:
         mode = "stale"
     elif status == "failed":
@@ -737,6 +800,37 @@ def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
     return points
 
 
+def aggregate_dimension_items(dimension: str, limit: int = 10) -> list[dict[str, Any]]:
+    prefix = "sample" if is_sample_mode() else "cloudflare"
+    if not dimension.startswith(f"{prefix}:"):
+        return []
+    with db_session() as connection:
+        rows = connection.execute(
+            """
+            SELECT dimension_value, SUM(total_count) AS total_count
+            FROM event_aggregates
+            WHERE dimension = ?
+            GROUP BY dimension_value
+            ORDER BY total_count DESC
+            LIMIT ?
+            """,
+            (dimension, limit),
+        ).fetchall()
+    return [{"label": str(row["dimension_value"]), "value": int(row["total_count"])} for row in rows]
+
+
+def aggregate_ranked_items(dimension: str, detail: str, limit: int = 5) -> list[dict[str, Any]]:
+    return [
+        {
+            "label": item["label"],
+            "value": item["value"],
+            "detail": detail,
+            "riskLevel": "info",
+        }
+        for item in aggregate_dimension_items(dimension, limit)
+    ]
+
+
 def get_overview() -> dict[str, Any]:
     trend = get_traffic_trend()
     recent_events = list_events({"limit": 6})
@@ -757,6 +851,21 @@ def get_overview() -> dict[str, Any]:
     top_paths = _ranked("path", "event_type")
     top_agents = _ranked("user_agent", "event_type")
     countries = _ranked("country", "event_type")
+    if not status_codes and not is_sample_mode():
+        status_codes = aggregate_dimension_items("cloudflare:status")
+        for item in status_codes:
+            try:
+                code = int(item["label"])
+            except ValueError:
+                code = 0
+            if code >= 500:
+                item["riskLevel"] = "high"
+            elif code >= 400:
+                item["riskLevel"] = "medium"
+    if not top_paths and not is_sample_mode():
+        top_paths = aggregate_ranked_items("cloudflare:path", "HTTP path")
+    if not countries and not is_sample_mode():
+        countries = aggregate_ranked_items("cloudflare:country", "Source country/region")
     points = get_globe_points()
 
     total_24h = sum(point["requests"] for point in trend)

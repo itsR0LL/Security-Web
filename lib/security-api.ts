@@ -1,9 +1,11 @@
 import {
   createSampleSecurityData,
   type SecurityEvent,
+  type SecurityDataMode,
   type SecurityOverview,
   type SecurityRuleHit,
   type SecuritySettings,
+  type SyncStatus,
   type RiskLevel,
 } from "./security-data";
 
@@ -41,7 +43,7 @@ export type CloudflareSettingsPayload = {
 
 export type TokenCheckResult = {
   checkedAt: string;
-  status: "success" | "failed" | "partial";
+  status: "success" | "failed" | "partial" | "degraded";
   zoneRead: boolean;
   analyticsRead: boolean;
   securityEventsRead: boolean;
@@ -50,12 +52,38 @@ export type TokenCheckResult = {
   permissions?: SecuritySettings["permissions"];
 };
 
+export type TokenCheckApiResult = {
+  mode: SecurityDataMode;
+  status: "sample" | "mock" | "degraded" | "live" | "stale" | "success" | "failed" | "partial" | string;
+  cloudflareLive: boolean;
+  message: string;
+  tokenCheck: TokenCheckResult;
+  settings?: SecuritySettings;
+  usedStaleData?: boolean;
+};
+
 export type SyncRunResult = {
-  mode: "sample" | "mock" | "mock-cloudflare" | "live" | "degraded" | "stale";
+  mode: SecurityDataMode;
+  status?: "sample" | "mock" | "success" | "failed" | "partial" | "stale" | "degraded" | string;
+  cloudflareLive?: boolean;
+  usedStaleData?: boolean;
   message: string;
   events?: number;
   aggregates?: number;
   tokenCheck?: TokenCheckResult;
+};
+
+export type AnalysisSummary = {
+  status?: string;
+  message?: string;
+  summary?: string;
+  generatedAt?: string;
+  items?: Array<{
+    label: string;
+    value: string | number;
+    detail?: string;
+  }>;
+  [key: string]: unknown;
 };
 
 function getApiBaseUrl() {
@@ -269,6 +297,21 @@ function normalizeSecurityEvent(event: SecurityEvent): SecurityEvent {
   };
 }
 
+function createLocalTokenCheckApiResult(zoneId: string, apiToken?: string): TokenCheckApiResult {
+  const tokenCheck = createLocalTokenCheck(zoneId, apiToken);
+  const mode: SecurityDataMode = tokenCheck.status === "success" ? "mock" : "sample";
+  return {
+    mode,
+    status: mode,
+    cloudflareLive: false,
+    message:
+      tokenCheck.status === "success"
+        ? "Token 仅通过本地格式校验，尚未完成 Cloudflare 实时校验。"
+        : "当前只完成本地格式校验，等待真实 Cloudflare 校验。",
+    tokenCheck,
+  };
+}
+
 export async function getSecurityOverview(): Promise<SecurityApiResult<SecurityOverview>> {
   return fetchWithFallback("/api/overview", createSampleSecurityData().overview);
 }
@@ -296,9 +339,23 @@ export async function getSecuritySettings(): Promise<SecurityApiResult<SecurityS
   return fetchWithFallback("/api/settings", createSampleSecurityData().settings);
 }
 
-export async function saveCloudflareSettings(payload: CloudflareSettingsPayload) {
+export async function getSecuritySyncStatus(): Promise<SecurityApiResult<SyncStatus>> {
+  const fallback = createSampleSecurityData().overview.sync;
+  return fetchWithFallback("/api/sync/status", {
+    ...fallback,
+    mode: "sample",
+    cloudflareLive: false,
+  });
+}
+
+export async function getAnalysisSummary(): Promise<SecurityApiResult<AnalysisSummary | null>> {
+  return fetchWithFallback<AnalysisSummary | null>("/api/analysis/summary", null);
+}
+
+export async function saveCloudflareSettings(payload: CloudflareSettingsPayload): Promise<SecurityApiResult<TokenCheckApiResult>> {
   const sample = createSampleSecurityData().settings;
   const fallback = {
+    ...createLocalTokenCheckApiResult(payload.zoneId, payload.apiToken),
     settings: {
       ...sample,
       monitoredHost: payload.monitoredHost || sample.monitoredHost,
@@ -307,22 +364,24 @@ export async function saveCloudflareSettings(payload: CloudflareSettingsPayload)
       hasCloudflareToken: Boolean(payload.apiToken || sample.hasCloudflareToken),
       sampleMode: !payload.apiToken && !sample.hasCloudflareToken,
     },
-    tokenCheck: createLocalTokenCheck(payload.zoneId, payload.apiToken),
   };
   return postWithFallback("/api/settings/cloudflare", payload, fallback);
 }
 
 export async function checkCloudflareToken(payload: Partial<CloudflareSettingsPayload>) {
-  return postWithFallback<TokenCheckResult>(
+  return postWithFallback<TokenCheckApiResult>(
     "/api/token/check",
     payload,
-    createLocalTokenCheck(payload.zoneId ?? "", payload.apiToken),
+    createLocalTokenCheckApiResult(payload.zoneId ?? "", payload.apiToken),
   );
 }
 
 export async function runSecuritySync() {
   return postWithFallback<SyncRunResult>("/api/sync/run", {}, {
     mode: "sample",
+    status: "sample",
+    cloudflareLive: false,
+    usedStaleData: false,
     message: "未连接后端，当前仅刷新前端样例状态。",
     events: createSampleSecurityData().events.length,
     aggregates: createSampleSecurityData().overview.trafficTrend.length,

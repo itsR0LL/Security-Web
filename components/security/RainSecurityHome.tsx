@@ -20,6 +20,8 @@ const syncStatusLabel: Record<SyncStatusValue, string> = {
   failed: "DEGRADED",
   partial: "PARTIAL",
   sample: "SAMPLE",
+  degraded: "DEGRADED",
+  stale: "STALE",
 };
 
 const railNavItems = [

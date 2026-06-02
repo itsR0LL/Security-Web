@@ -1,4 +1,4 @@
-import { getSecurityEvents } from "@/lib/security-api";
+import { getSecurityEvents, getSecuritySyncStatus } from "@/lib/security-api";
 import { RainSecuritySubPage, type EventInitialFilters } from "@/components/security/RainSecuritySubPage";
 
 type SecurityEventsPageProps = {
@@ -23,25 +23,29 @@ export default async function SecurityEventsPage({ searchParams }: SecurityEvent
     timeRange: firstParam(params, "timeRange"),
     event: firstParam(params, "event"),
   };
-  const result = await getSecurityEvents({
-    risk: initialFilters.risk,
-    eventType: initialFilters.eventType,
-    ip: initialFilters.ip,
-    country: initialFilters.country,
-    path: initialFilters.path,
-    action: initialFilters.action,
-    statusCode: initialFilters.statusCode,
-    timeRange: initialFilters.timeRange,
-    limit: 100,
-  });
+  const [result, syncStatus] = await Promise.all([
+    getSecurityEvents({
+      risk: initialFilters.risk,
+      eventType: initialFilters.eventType,
+      ip: initialFilters.ip,
+      country: initialFilters.country,
+      path: initialFilters.path,
+      action: initialFilters.action,
+      statusCode: initialFilters.statusCode,
+      timeRange: initialFilters.timeRange,
+      limit: 100,
+    }),
+    getSecuritySyncStatus(),
+  ]);
 
   return (
     <RainSecuritySubPage
       page="events"
       events={result.data}
+      syncStatus={syncStatus.data}
       initialFilters={initialFilters}
       source={result.source}
-      error={result.error}
+      error={result.error ?? syncStatus.error}
     />
   );
 }

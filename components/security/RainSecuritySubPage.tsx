@@ -8,11 +8,11 @@ import {
   runSecuritySync,
   saveCloudflareSettings,
   updateRiskThreshold,
-  type TokenCheckResult,
+  type TokenCheckApiResult,
 } from "@/lib/security-api";
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
-import type { PermissionCheck, RiskLevel, SecurityEvent, SecurityRuleHit, SecuritySettings } from "@/lib/security-data";
+import type { PermissionCheck, RiskLevel, SecurityDataMode, SecurityEvent, SecurityRuleHit, SecuritySettings, SyncStatus } from "@/lib/security-data";
 
 export type EventInitialFilters = {
   risk?: string;
@@ -32,6 +32,7 @@ type RainSecuritySubPageProps =
   | {
       page: "events";
       events: SecurityEvent[];
+      syncStatus: SyncStatus;
       initialFilters?: EventInitialFilters;
       source: "api" | "sample";
       error?: string;
@@ -39,6 +40,7 @@ type RainSecuritySubPageProps =
   | {
       page: "settings";
       settings: SecuritySettings;
+      syncStatus: SyncStatus;
       source: "api" | "sample";
       error?: string;
     };
@@ -164,9 +166,55 @@ function buildEventQuery(filters: FilterState) {
   return params.toString();
 }
 
-function sampleState(source: "api" | "sample", error?: string) {
-  if (error) return "DEGRADED";
-  return source === "api" ? "LIVE" : "SAMPLE";
+type ModeCopy = {
+  label: string;
+  detail: string;
+  tone: "live" | "degraded" | "stale" | "mock" | "sample";
+};
+
+function resolveDataMode(source: "api" | "sample", error?: string, syncStatus?: SyncStatus): SecurityDataMode {
+  if (syncStatus?.mode && !(error && source === "api" && syncStatus.mode === "sample")) return syncStatus.mode;
+  if (syncStatus?.usedStaleData) return "stale";
+  if (syncStatus?.status === "failed") return "degraded";
+  if (error && source === "api") return "degraded";
+  if (source === "api") return "live";
+  return "sample";
+}
+
+function modeCopy(mode: SecurityDataMode, syncStatus?: SyncStatus): ModeCopy {
+  if (mode === "live") {
+    return {
+      label: "LIVE",
+      detail: "Cloudflare 实时同步可用，当前数据来自后端 live 模式。",
+      tone: "live",
+    };
+  }
+  if (mode === "stale") {
+    return {
+      label: "STALE",
+      detail: "同步失败，当前展示上次成功保留的旧数据。",
+      tone: "stale",
+    };
+  }
+  if (mode === "degraded") {
+    return {
+      label: "DEGRADED",
+      detail: syncStatus?.apiError || "Cloudflare 校验或同步失败，页面保留可读数据。",
+      tone: "degraded",
+    };
+  }
+  if (mode === "mock" || mode === "mock-cloudflare") {
+    return {
+      label: mode === "mock-cloudflare" ? "MOCK-CF" : "MOCK",
+      detail: "Token 格式通过，本阶段未调用 Cloudflare，展示结构等价同步数据。",
+      tone: "mock",
+    };
+  }
+  return {
+    label: "SAMPLE",
+    detail: "未接入后端或未配置 Token，当前展示样例数据。",
+    tone: "sample",
+  };
 }
 
 function HudMetric({ label, value }: { label: string; value: string }) {
@@ -289,11 +337,13 @@ function compactEventLine(event: SecurityEvent) {
 function RainEventConsole({
   events,
   initialFilters,
+  syncStatus,
   source,
   error,
 }: {
   events: SecurityEvent[];
   initialFilters: EventInitialFilters;
+  syncStatus: SyncStatus;
   source: "api" | "sample";
   error?: string;
 }) {
@@ -312,6 +362,8 @@ function RainEventConsole({
   const selectedPrimaryRule = selectedEvent ? primaryRuleHit(selectedEvent) : null;
   const highCount = visibleEvents.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length;
   const blockedCount = visibleEvents.filter((event) => event.action === "block" || event.action === "managed_challenge").length;
+  const dataMode = resolveDataMode(source, error, syncStatus);
+  const dataModeInfo = modeCopy(dataMode, syncStatus);
 
   const updateFilter = <K extends keyof FilterState>(key: K, value: FilterState[K]) => {
     setFilters((current) => ({ ...current, [key]: value }));
@@ -337,7 +389,11 @@ function RainEventConsole({
         <HudMetric label="MATCHED" value={String(visibleEvents.length)} />
         <HudMetric label="HIGH+" value={String(highCount)} />
         <HudMetric label="CONTAINED" value={String(blockedCount)} />
-        <HudMetric label="MODE" value={sampleState(source, error)} />
+        <HudMetric label="MODE" value={dataModeInfo.label} />
+        <div className="rain-mode-note" data-mode={dataModeInfo.tone}>
+          <strong>{dataModeInfo.label}</strong>
+          <span>{dataModeInfo.detail}</span>
+        </div>
 
         <FieldLabel label="TIME WINDOW">
           <select value={filters.timeRange} onChange={(event) => updateFilter("timeRange", event.target.value as FilterState["timeRange"])}>
@@ -509,12 +565,31 @@ function permissionStatus(permissions: PermissionCheck[]) {
   return "FAILED";
 }
 
+function tokenFormatStatus(zoneId: string, token: string, hasToken: boolean) {
+  const zoneOk = /^[A-Za-z0-9_-]{8,}$/.test(zoneId || "");
+  const tokenOk = Boolean(token && token.length >= 10 && !/\s/.test(token));
+  if (!token && hasToken) return zoneOk ? "STORED" : "ZONE PENDING";
+  if (zoneOk && tokenOk) return "LOCAL OK";
+  if (!zoneId && !token && !hasToken) return "EMPTY";
+  return "LOCAL FAIL";
+}
+
+function realCheckStatus(mode: SecurityDataMode, cloudflareLive?: boolean) {
+  if (cloudflareLive || mode === "live") return "CLOUDFLARE LIVE";
+  if (mode === "stale") return "STALE DATA";
+  if (mode === "degraded") return "DEGRADED";
+  if (mode === "mock" || mode === "mock-cloudflare") return "LOCAL ONLY";
+  return "SAMPLE";
+}
+
 function RainSettingsConsole({
   settings,
+  syncStatus,
   source,
   error,
 }: {
   settings: SecuritySettings;
+  syncStatus: SyncStatus;
   source: "api" | "sample";
   error?: string;
 }) {
@@ -531,6 +606,10 @@ function RainSettingsConsole({
 
   const sampleMode = !hasToken && !token;
   const readiness = permissionStatus(permissions);
+  const dataMode = resolveDataMode(source, error, syncStatus);
+  const dataModeInfo = modeCopy(dataMode, syncStatus);
+  const formatStatus = tokenFormatStatus(zoneId, token, hasToken);
+  const cloudflareStatus = realCheckStatus(dataMode, syncStatus.cloudflareLive);
 
   const saveSettings = async () => {
     setBusy("save");
@@ -541,20 +620,21 @@ function RainSettingsConsole({
       refreshIntervalHours: refreshHours,
     });
     setBusy(null);
-    if ("settings" in result.data) {
-      setHasToken(result.data.settings.hasCloudflareToken);
-      setPermissions(result.data.settings.permissions ?? permissions);
+    const savedSettings = result.data.settings;
+    if (savedSettings) {
+      setHasToken(savedSettings.hasCloudflareToken);
+      setPermissions(savedSettings.permissions ?? permissions);
     }
-    setMessage(result.error ?? "CONFIG SAVED");
+    setMessage(result.error ?? `${result.data.mode.toUpperCase()} / ${result.data.message || "CONFIG SAVED"}`);
   };
 
   const checkToken = async () => {
     setBusy("check");
     const result = await checkCloudflareToken({ zoneId, apiToken: token || undefined, monitoredHost, refreshIntervalHours: refreshHours });
     setBusy(null);
-    const check = result.data as TokenCheckResult;
+    const check = (result.data as TokenCheckApiResult).tokenCheck;
     if (check.permissions) setPermissions(check.permissions);
-    setMessage(result.error ?? check.errorMessage ?? `TOKEN CHECK ${check.status.toUpperCase()}`);
+    setMessage(result.error ?? result.data.message ?? check.errorMessage ?? `TOKEN CHECK ${check.status.toUpperCase()}`);
   };
 
   const syncNow = async () => {
@@ -575,11 +655,17 @@ function RainSettingsConsole({
       <aside className="rain-console-spine" aria-label="配置状态">
         <p>CONTROL SPINE</p>
         <HudMetric label="HOST" value={monitoredHost} />
-        <HudMetric label="MODE" value={sampleMode ? "SAMPLE" : sampleState(source, error)} />
+        <HudMetric label="MODE" value={sampleMode ? "SAMPLE" : dataModeInfo.label} />
+        <HudMetric label="FORMAT" value={formatStatus} />
+        <HudMetric label="CHECK" value={cloudflareStatus} />
         <HudMetric label="TOKEN" value={hasToken ? "CONFIGURED" : "EMPTY"} />
         <HudMetric label="PERMISSION" value={readiness} />
         <HudMetric label="SYNC" value={`${refreshHours}H`} />
         <HudMetric label="RAW" value={`${retentionDays}D`} />
+        <div className="rain-mode-note" data-mode={dataModeInfo.tone}>
+          <strong>{dataModeInfo.label}</strong>
+          <span>{dataModeInfo.detail}</span>
+        </div>
       </aside>
 
       <section className="rain-console-main" aria-label="Cloudflare 配置">
@@ -638,18 +724,19 @@ function RainSettingsConsole({
         <div className="rain-template-block" aria-live="polite">
           <span>OPERATION RESULT</span>
           <p>{message}</p>
+          <p>Token 格式: {formatStatus} / 真实校验: {cloudflareStatus}</p>
         </div>
       </section>
 
       <aside className="rain-console-detail" aria-label="权限与边界">
         <div className="rain-detail-heading">
           <span>TOKEN READINESS</span>
-          <strong>{sampleMode ? "SAMPLE MODE" : readiness}</strong>
+          <strong>{sampleMode ? "SAMPLE MODE" : `${readiness} / ${cloudflareStatus}`}</strong>
         </div>
         <div className="rain-detail-summary">
           {sampleMode
-            ? "未配置 Cloudflare Token 时自动启用样例数据。Token 无效、权限不足或同步失败时不会伪装成样例数据。"
-            : "Token 已配置；页面只显示配置状态，不回显 Token 明文。"}
+            ? "未配置 Cloudflare Token 时自动启用样例数据。Token 无效、权限不足或同步失败时，页面会展示 degraded 或 stale 状态。"
+            : "Token 已配置；页面只显示配置状态，不回显 Token 明文。真实 Cloudflare 状态以 CHECK 和 MODE 为准。"}
         </div>
         <div className="rain-rule-list">
           <span>PERMISSIONS</span>
@@ -673,18 +760,20 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
   const { cursorRef } = useRainCursor();
   const isEvents = props.page === "events";
   const pageMeta = isEvents ? pageCopy.events : pageCopy.settings;
+  const dataMode = resolveDataMode(props.source, props.error, props.syncStatus);
+  const dataModeInfo = modeCopy(dataMode, props.syncStatus);
 
   const stats: Array<[string, string]> = isEvents
     ? [
         ["EVENTS", props.events.length.toString()],
         ["HIGH+", props.events.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length.toString()],
         ["AREAS", new Set(props.events.map((event) => event.country).filter(Boolean)).size.toString()],
-        ["MODE", sampleState(props.source, props.error)],
+        ["MODE", dataModeInfo.label],
       ]
     : [
         ["ZONE", props.settings.zoneId ? "READY" : "PENDING"],
         ["TOKEN", props.settings.hasCloudflareToken ? "READY" : "EMPTY"],
-        ["SYNC", props.settings.sampleMode ? "SAMPLE" : "LIVE"],
+        ["SYNC", props.settings.sampleMode ? "SAMPLE" : dataModeInfo.label],
         ["RISK", riskText[props.settings.highRiskThreshold]],
       ];
 
@@ -725,11 +814,12 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
             <RainEventConsole
               events={props.events}
               initialFilters={props.initialFilters ?? {}}
+              syncStatus={props.syncStatus}
               source={props.source}
               error={props.error}
             />
           ) : (
-            <RainSettingsConsole settings={props.settings} source={props.source} error={props.error} />
+            <RainSettingsConsole settings={props.settings} syncStatus={props.syncStatus} source={props.source} error={props.error} />
           )}
         </div>
       </section>

@@ -6,12 +6,14 @@ import type { GlobeRouteHover } from "@/components/security/ParticleGlobe";
 import { RouteHoverPopover } from "@/components/security/RouteHoverPopover";
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
-import type { RiskLevel, SecurityOverview } from "@/lib/security-data";
+import type { AnalysisSummary } from "@/lib/security-api";
+import type { RiskLevel, SecurityDataMode, SecurityOverview } from "@/lib/security-data";
 
 type ViewMode = "3d" | "2d";
 
 type SituationVisualizationProps = {
   overview: SecurityOverview;
+  analysisSummary?: AnalysisSummary | null;
   source: "api" | "sample";
   error?: string;
   initialView?: ViewMode;
@@ -43,8 +45,25 @@ function formatEventTime(timestamp: string) {
   });
 }
 
+function resolveSituationMode(source: "api" | "sample", error: string | undefined, overview: SecurityOverview): SecurityDataMode {
+  if (overview.sync.mode && !(error && source === "api" && overview.sync.mode === "sample")) return overview.sync.mode;
+  if (overview.sync.usedStaleData) return "stale";
+  if (overview.sync.status === "failed") return "degraded";
+  if (source === "api" && !error) return "live";
+  return "sample";
+}
+
+function situationModeText(mode: SecurityDataMode, overview: SecurityOverview) {
+  if (mode === "live") return "Cloudflare live data";
+  if (mode === "stale") return "Showing retained stale data";
+  if (mode === "degraded") return overview.sync.apiError || "Cloudflare sync degraded";
+  if (mode === "mock" || mode === "mock-cloudflare") return "Local token check with mock sync data";
+  return "Sample data mode";
+}
+
 export function SituationVisualization({
   overview,
+  analysisSummary,
   source,
   error,
   initialView = "3d",
@@ -52,7 +71,9 @@ export function SituationVisualization({
   const [view, setView] = useState<ViewMode>(initialView);
   const [routeHover, setRouteHover] = useState<GlobeRouteHover | null>(null);
   const { cursorRef } = useRainCursor();
-  const status = source === "api" && !error ? "LIVE" : "SAMPLE";
+  const mode = resolveSituationMode(source, error, overview);
+  const status = mode.toUpperCase();
+  const analysisText = analysisSummary?.summary || analysisSummary?.message;
 
   return (
     <main className="rain-situation-page">
@@ -131,6 +152,24 @@ export function SituationVisualization({
               <small>{event.path}</small>
             </div>
           ))}
+        </div>
+
+        <div className="situation-panel-section situation-data-section">
+          <p>DATA STATE</p>
+          <div className="situation-data-row">
+            <span>MODE</span>
+            <strong>{status}</strong>
+          </div>
+          <div className="situation-data-row">
+            <span>EVENTS</span>
+            <strong>{formatCompact(overview.sync.localEventCount)}</strong>
+          </div>
+          <div className="situation-data-row">
+            <span>AGG</span>
+            <strong>{formatCompact(overview.sync.aggregateCount)}</strong>
+          </div>
+          <small>{situationModeText(mode, overview)}</small>
+          {analysisText && <small>{analysisText}</small>}
         </div>
 
         <div className="situation-sync-line" data-status={overview.sync.status}>
