@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useMemo, useState, useTransition } from "react";
 import {
   checkCloudflareToken,
@@ -25,6 +25,8 @@ export type EventInitialFilters = {
   statusCode?: string;
   method?: string;
   userAgent?: string;
+  attackCategory?: string;
+  ruleId?: string;
   timeRange?: string;
   event?: string;
 };
@@ -56,6 +58,8 @@ type FilterState = {
   method: string;
   statusCode: string;
   action: string;
+  attackCategory: string;
+  ruleId: string;
   timeRange: "6h" | "24h" | "7d" | "all";
 };
 
@@ -77,7 +81,7 @@ const riskText: Record<RiskLevel, string> = {
 
 const riskOptions: Array<"all" | RiskLevel> = ["all", "info", "low", "medium", "high", "critical"];
 const actionOptions = ["all", "allow", "block", "blocked", "challenge", "managed_challenge", "js_challenge", "log", "simulate"];
-const methodOptions = ["all", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
+const methodOptions = ["all", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 const pageCopy = {
   events: {
@@ -117,6 +121,8 @@ function buildFilters(initialFilters: EventInitialFilters = {}): FilterState {
     method: initialFilters.method || "all",
     statusCode: initialFilters.statusCode || "",
     action: initialFilters.action || "all",
+    attackCategory: initialFilters.attackCategory || "",
+    ruleId: initialFilters.ruleId || "",
     timeRange: normalizeTimeRange(initialFilters.timeRange),
   };
 }
@@ -139,12 +145,18 @@ function eventMatchesRisk(event: SecurityEvent, risk: FilterState["risk"]) {
   return event.riskLevel === risk;
 }
 
+function eventRuleIds(event: SecurityEvent) {
+  return Array.from(new Set([event.ruleId, ...eventRuleHits(event).map((rule) => rule.id)].filter(Boolean)));
+}
+
 function eventMatchesFilters(event: SecurityEvent, filters: FilterState) {
   if (!eventMatchesRisk(event, filters.risk)) return false;
   if (filters.eventType !== "all" && event.eventType !== filters.eventType) return false;
   if (filters.action !== "all" && event.action !== filters.action) return false;
   if (filters.method !== "all" && event.method !== filters.method) return false;
   if (filters.statusCode && String(event.statusCode) !== filters.statusCode) return false;
+  if (filters.attackCategory && event.attackCategory !== filters.attackCategory) return false;
+  if (filters.ruleId && !eventRuleIds(event).includes(filters.ruleId)) return false;
   if (filters.ip && !event.clientIp.toLowerCase().includes(filters.ip.toLowerCase())) return false;
   if (filters.country && !`${event.country} ${event.region} ${event.city}`.toLowerCase().includes(filters.country.toLowerCase())) return false;
   if (filters.path && !`${event.path} ${event.query ?? ""}`.toLowerCase().includes(filters.path.toLowerCase())) return false;
@@ -163,6 +175,8 @@ function buildEventQuery(filters: FilterState) {
   if (filters.method !== "all") params.set("method", filters.method);
   if (filters.statusCode) params.set("statusCode", filters.statusCode);
   if (filters.action !== "all") params.set("action", filters.action);
+  if (filters.attackCategory) params.set("attackCategory", filters.attackCategory);
+  if (filters.ruleId) params.set("ruleId", filters.ruleId);
   if (filters.timeRange !== "24h") params.set("timeRange", filters.timeRange);
   return params.toString();
 }
@@ -360,10 +374,34 @@ function RainEventConsole({
   error?: string;
 }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [isPending, startTransition] = useTransition();
-  const [filters, setFilters] = useState<FilterState>(() => buildFilters(initialFilters));
-  const [selectedId, setSelectedId] = useState(initialFilters.event ?? events[0]?.id ?? "");
+  const mergedInitialFilters = useMemo<EventInitialFilters>(
+    () => ({
+      ...initialFilters,
+      risk: searchParams.get("risk") ?? initialFilters.risk,
+      eventType: searchParams.get("eventType") ?? initialFilters.eventType,
+      ip: searchParams.get("ip") ?? searchParams.get("source") ?? initialFilters.ip,
+      country: searchParams.get("country") ?? initialFilters.country,
+      path: searchParams.get("path") ?? initialFilters.path,
+      action: searchParams.get("action") ?? initialFilters.action,
+      statusCode: searchParams.get("statusCode") ?? initialFilters.statusCode,
+      method: searchParams.get("method") ?? initialFilters.method,
+      userAgent: searchParams.get("userAgent") ?? initialFilters.userAgent,
+      attackCategory: searchParams.get("attackCategory") ?? initialFilters.attackCategory,
+      ruleId: searchParams.get("ruleId") ?? initialFilters.ruleId,
+      timeRange: searchParams.get("timeRange") ?? initialFilters.timeRange,
+      event: searchParams.get("event") ?? initialFilters.event,
+    }),
+    [initialFilters, searchParams],
+  );
+  const [filters, setFilters] = useState<FilterState>(() => buildFilters(mergedInitialFilters));
+  const [selectedId, setSelectedId] = useState(mergedInitialFilters.event ?? events[0]?.id ?? "");
   const eventTypes = useMemo(() => Array.from(new Set(events.map((event) => event.eventType))).filter(Boolean), [events]);
+  const attackCategories = useMemo(
+    () => Array.from(new Set(events.map((event) => event.attackCategory || event.eventType))).filter(Boolean),
+    [events],
+  );
 
   const visibleEvents = useMemo(
     () => events.filter((event) => eventMatchesFilters(event, filters)).sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)),
@@ -435,6 +473,21 @@ function RainEventConsole({
               </option>
             ))}
           </select>
+        </FieldLabel>
+
+        <FieldLabel label="ATTACK CATEGORY">
+          <select value={filters.attackCategory} onChange={(event) => updateFilter("attackCategory", event.target.value)}>
+            <option value="">ALL CATEGORIES</option>
+            {attackCategories.map((attackCategory) => (
+              <option key={attackCategory} value={attackCategory}>
+                {attackCategory}
+              </option>
+            ))}
+          </select>
+        </FieldLabel>
+
+        <FieldLabel label="RULE ID">
+          <input value={filters.ruleId} placeholder="builtin-sensitive-path" onChange={(event) => updateFilter("ruleId", event.target.value)} />
         </FieldLabel>
 
         <FieldLabel label="SOURCE IP">
@@ -825,6 +878,7 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
         <div className="rain-mvp-workspace rain-mvp-workspace-rain">
           {isEvents ? (
             <RainEventConsole
+              key={JSON.stringify(props.initialFilters ?? {})}
               events={props.events}
               initialFilters={props.initialFilters ?? {}}
               syncStatus={props.syncStatus}

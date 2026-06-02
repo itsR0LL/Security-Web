@@ -11,6 +11,16 @@ export type TrafficKind = "visit" | "attack";
 export type SecurityRuleHit = {
   id: string;
   name: string;
+  ruleId?: string;
+  ruleName?: string;
+  ruleType?: string;
+  version?: string;
+  matchedField?: string;
+  matchedValue?: string;
+  attackCategory?: string;
+  attackSubtype?: string;
+  toolSignature?: string;
+  behaviorFingerprint?: string;
   mode: string;
   severity: RiskLevel | string;
   classification: string;
@@ -22,7 +32,7 @@ export type SecurityRuleHit = {
 export type SecurityEvent = {
   id: string;
   timestamp: string;
-  source: "cloudflare" | "origin" | "sample";
+  source: "cloudflare" | "worker_log" | "origin" | "sample";
   clientIp: string;
   country: string;
   region: string;
@@ -32,7 +42,7 @@ export type SecurityEvent = {
   locationPrecision: LocationPrecision;
   asn: string;
   host: string;
-  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD";
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
   path: string;
   query?: string;
   statusCode: number;
@@ -104,7 +114,7 @@ export type GlobePoint = {
   eventType: string;
   trafficKind?: TrafficKind;
   locationPrecision: LocationPrecision;
-  source?: SecurityEvent["source"] | "cloudflare_http_aggregate" | "raw_events";
+  source?: SecurityEvent["source"] | "cloudflare_aggregate" | "cloudflare_http_aggregate" | "worker_log_aggregate" | "raw_events";
   sourceType?: "normal_visit" | "security_event" | "raw_event";
   bandwidthBytes?: number;
   action?: SecurityEvent["action"];
@@ -173,6 +183,242 @@ export type SecuritySampleData = {
   overview: SecurityOverview;
   events: SecurityEvent[];
   settings: SecuritySettings;
+};
+
+export type AnalysisRuleDefinition = {
+  id: string;
+  version: string;
+  mode: string;
+  ruleType: string;
+  condition: Record<string, unknown>;
+  severity: RiskLevel | string;
+  classification: {
+    attackCategory: string;
+    attackSubtype: string;
+    toolSignature: string;
+    behaviorFingerprint: string;
+  };
+};
+
+export type AnalysisFiltersPayload = {
+  timeRange: string;
+  risk: string | null;
+  country: string | null;
+  attackCategory: string | null;
+  ruleId: string | null;
+};
+
+export type AnalysisCountItem = {
+  label: string;
+  value: number;
+  riskLevel?: RiskLevel | string;
+  attackCategory?: string;
+  ruleId?: string;
+};
+
+export type AnalysisEventEvidence = {
+  id: string;
+  timestamp: string;
+  clientIp: string;
+  country: string;
+  method: SecurityEvent["method"];
+  path: string;
+  query?: string | null;
+  statusCode: number;
+  action: SecurityEvent["action"];
+  riskLevel: RiskLevel;
+  ruleId: string;
+  ruleName: string;
+  summary: string;
+  ruleMatches: string[];
+};
+
+export type AnalysisRuleDraft = {
+  id: string;
+  version: string;
+  name: string;
+  enabled: boolean;
+  mode: string;
+  ruleType: string;
+  condition: Record<string, unknown>;
+  severity: RiskLevel | string;
+  classification: {
+    attackCategory: string;
+    attackSubtype: string;
+    toolSignature: string;
+    behaviorFingerprint: string;
+  };
+  actions?: {
+    alert: boolean;
+    block: boolean;
+  };
+  lifecycle?: {
+    createdBy: string;
+    reviewStatus: string;
+  };
+};
+
+export type AnalysisRule = {
+  ruleId: string;
+  ruleName: string;
+  eventCount: number;
+  riskLevel: RiskLevel | string;
+  severity: RiskLevel | string;
+  mode: string;
+  version: string;
+  attackCategory: string;
+  attackSubtype: string;
+  firstSeen: string;
+  lastSeen: string;
+  sourceCount: number;
+  pathCount: number;
+  matchedFields: AnalysisCountItem[];
+  matchedValues: AnalysisCountItem[];
+  definition?: AnalysisRuleDefinition;
+  evidence: AnalysisEventEvidence[];
+};
+
+export type AnalysisRulesResult = {
+  generatedAt: string;
+  filters: AnalysisFiltersPayload;
+  totalRules: number;
+  items: AnalysisRule[];
+};
+
+export type AnalysisPrimarySource = {
+  clientIp: string;
+  country: string;
+  region: string;
+  city: string;
+  asn: string;
+  latitude: number;
+  longitude: number;
+  locationPrecision: LocationPrecision;
+  count: number;
+};
+
+export type AnalysisPrimaryPath = {
+  method: SecurityEvent["method"] | string;
+  path: string;
+  statusCode: number;
+  count: number;
+};
+
+export type AnalysisPrimaryAction = {
+  action: SecurityEvent["action"] | string;
+  count: number;
+};
+
+export type AnalysisPrimaryUserAgent = {
+  userAgent: string;
+  count: number;
+};
+
+export type AnalysisCluster = {
+  clusterId: string;
+  attackCategory: string;
+  attackSubtype: string;
+  ruleId: string;
+  ruleName: string;
+  toolSignature: string;
+  behaviorFingerprint: string;
+  eventCount: number;
+  riskLevel: RiskLevel | string;
+  confidence: number;
+  timeRange: {
+    firstSeen: string;
+    lastSeen: string;
+  };
+  primarySource: AnalysisPrimarySource | null;
+  primaryPath: AnalysisPrimaryPath | null;
+  primaryAction: AnalysisPrimaryAction | null;
+  primaryUserAgent: AnalysisPrimaryUserAgent | null;
+  countries: AnalysisCountItem[];
+  paths: AnalysisCountItem[];
+  methods: AnalysisCountItem[];
+  statusCodes: AnalysisCountItem[];
+  actions: AnalysisCountItem[];
+  userAgents: AnalysisCountItem[];
+  evidence: AnalysisEventEvidence[];
+};
+
+export type AnalysisClustersResult = {
+  generatedAt: string;
+  filters: AnalysisFiltersPayload;
+  totalClusters: number;
+  items: AnalysisCluster[];
+};
+
+export type AnalysisSourceItem = {
+  clientIp: string;
+  country: string;
+  region: string;
+  city: string;
+  latitude: number;
+  longitude: number;
+  locationPrecision: LocationPrecision;
+  requestCount: number;
+  attackCount: number;
+  normalCount: number;
+  attackShare: number;
+  riskLevel: RiskLevel | string;
+  latestSeen?: string;
+  topAttackCategory: string;
+  topRuleId: string;
+  topPath: string;
+};
+
+export type AnalysisSourceCountry = {
+  country: string;
+  requestCount: number;
+  attackCount: number;
+  normalCount: number;
+  attackShare: number;
+  riskLevel: RiskLevel | string;
+};
+
+export type AnalysisSources = {
+  generatedAt: string;
+  filters: AnalysisFiltersPayload;
+  totalRequests: number;
+  totalAttackEvents: number;
+  normalRequests: number;
+  attackShare: number;
+  affectedSources: number;
+  affectedCountries: number;
+  items: AnalysisSourceItem[];
+  countries: AnalysisSourceCountry[];
+};
+
+export type AnalysisAdvice = {
+  id: string;
+  status: string;
+  sourceClusterId: string;
+  title: string;
+  riskLevel: RiskLevel | string;
+  confidence: number;
+  rationale: string;
+  impact: {
+    eventCount: number;
+    sourceCount: number;
+    pathCount: number;
+    timeRange: {
+      firstSeen: string;
+      lastSeen: string;
+    };
+  };
+  ruleDraft: AnalysisRuleDraft;
+  evidence: AnalysisEventEvidence[];
+  manualReviewQuestions: string[];
+};
+
+export type AnalysisAdviceResult = {
+  status: string;
+  message: string;
+  generatedAt: string;
+  filters: AnalysisFiltersPayload;
+  totalDrafts: number;
+  items: AnalysisAdvice[];
 };
 
 export const riskLabels: Record<RiskLevel, string> = {
@@ -792,4 +1038,476 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
 
 export function getRiskRank(riskLevel: RiskLevel) {
   return riskOrder.indexOf(riskLevel);
+}
+
+function riskRankValue(riskLevel: RiskLevel | string) {
+  return riskOrder.includes(riskLevel as RiskLevel) ? riskOrder.indexOf(riskLevel as RiskLevel) : 0;
+}
+
+function mostUsed(values: Array<string | undefined>, fallback = "unknown") {
+  const counts = new Map<string, number>();
+  values.filter((value): value is string => Boolean(value)).forEach((value) => counts.set(value, (counts.get(value) ?? 0) + 1));
+  const ranked = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  return ranked[0]?.[0] ?? fallback;
+}
+
+function eventRuleHits(event: SecurityEvent): SecurityRuleHit[] {
+  if (event.ruleHits?.length) return event.ruleHits;
+  if (!event.ruleId && !event.ruleName) return [];
+  return [
+    {
+      id: event.ruleId,
+      name: event.ruleName || event.ruleId,
+      mode: "observe",
+      severity: event.riskLevel,
+      classification: event.attackCategory || event.eventType,
+      evidence: event.ruleMatches,
+      confidence: event.confidence,
+      matched: true,
+    },
+  ];
+}
+
+function defaultAnalysisFilters(): AnalysisFiltersPayload {
+  return {
+    timeRange: "24h",
+    risk: null,
+    country: null,
+    attackCategory: null,
+    ruleId: null,
+  };
+}
+
+function maxRiskLevel(events: SecurityEvent[]) {
+  return events.reduce<RiskLevel>((current, event) => (riskRankValue(event.riskLevel) > riskRankValue(current) ? event.riskLevel : current), "info");
+}
+
+function countItems(values: Array<string | number | undefined | null>, limit = 8): AnalysisCountItem[] {
+  const counts = new Map<string, number>();
+  values.forEach((value) => {
+    const label = String(value ?? "").trim();
+    if (!label) return;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .map(([label, value]) => ({ label, value }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, limit);
+}
+
+function eventEvidence(event: SecurityEvent): AnalysisEventEvidence {
+  return {
+    id: event.id,
+    timestamp: event.timestamp,
+    clientIp: event.clientIp,
+    country: event.country,
+    method: event.method,
+    path: event.path,
+    query: event.query ?? null,
+    statusCode: event.statusCode,
+    action: event.action,
+    riskLevel: event.riskLevel,
+    ruleId: event.ruleId,
+    ruleName: event.ruleName,
+    summary: event.summary,
+    ruleMatches: event.ruleMatches,
+  };
+}
+
+function ruleDefinitionFromBase(rule: {
+  id: string;
+  version: string;
+  mode: string;
+  ruleType: string;
+  condition: Record<string, unknown>;
+  severity: RiskLevel | string;
+  attackCategory: string;
+  attackSubtype: string;
+  toolSignature: string;
+  behaviorFingerprint: string;
+}): AnalysisRuleDefinition {
+  return {
+    id: rule.id,
+    version: rule.version,
+    mode: rule.mode,
+    ruleType: rule.ruleType,
+    condition: rule.condition,
+    severity: rule.severity,
+    classification: {
+      attackCategory: rule.attackCategory,
+      attackSubtype: rule.attackSubtype,
+      toolSignature: rule.toolSignature,
+      behaviorFingerprint: rule.behaviorFingerprint,
+    },
+  };
+}
+
+function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: string }> {
+  const rules = [
+    {
+      id: "builtin-sensitive-path",
+      name: "Sensitive path probe",
+      ruleType: "path_keyword",
+      condition: {
+        keywords: [
+          ".env",
+          ".env.local",
+          ".env.bak",
+          ".env.backup",
+          "wp-login.php",
+          "phpmyadmin",
+          "/admin",
+          "firebase-adminsdk.json",
+          "firebase.json",
+          "google-credentials.json",
+          "credentials.json",
+          "config.json",
+          "key.json",
+        ],
+      },
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "reconnaissance",
+      attackSubtype: "sensitive_path_probe",
+      toolSignature: "scanner_path_probe",
+      behaviorFingerprint: "http_path_keyword_probe",
+    },
+    {
+      id: "builtin-sqli",
+      name: "SQL injection probe",
+      ruleType: "query_keyword",
+      condition: { keywords: [" OR 1=1", "UNION SELECT", "--"] },
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "injection",
+      attackSubtype: "sql_injection_probe",
+      toolSignature: "manual_or_scanner_sqli",
+      behaviorFingerprint: "http_query_sqli_keyword",
+    },
+    {
+      id: "builtin-xss",
+      name: "XSS probe",
+      ruleType: "query_keyword",
+      condition: { keywords: ["<script", "javascript:", "onerror="] },
+      severity: "medium",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "injection",
+      attackSubtype: "xss_probe",
+      toolSignature: "manual_or_scanner_xss",
+      behaviorFingerprint: "http_query_xss_keyword",
+    },
+    {
+      id: "builtin-scanner-ua",
+      name: "Scanner User-Agent",
+      ruleType: "user_agent_keyword",
+      condition: { keywords: ["curl", "zgrab", "python-requests", "Go-http-client"] },
+      severity: "medium",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "reconnaissance",
+      attackSubtype: "scanner_user_agent",
+      toolSignature: "scanner_user_agent",
+      behaviorFingerprint: "http_user_agent_keyword",
+    },
+    {
+      id: "builtin-cloudflare-action",
+      name: "Cloudflare security action",
+      ruleType: "cloudflare_action",
+      condition: { actions: ["block", "challenge", "managed_challenge"] },
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "edge_security",
+      attackSubtype: "cloudflare_action",
+      toolSignature: "cloudflare_firewall",
+      behaviorFingerprint: "cloudflare_action_match",
+    },
+  ];
+
+  return Object.fromEntries(rules.map((rule) => [rule.id, { ...ruleDefinitionFromBase(rule), name: rule.name }]));
+}
+
+export function createAnalysisClusters(events: SecurityEvent[] = createSampleSecurityData().events): AnalysisClustersResult {
+  const attackEvents = events.filter((event) => resolveTrafficKind(event) === "attack" || riskRankValue(event.riskLevel) >= riskRankValue("medium"));
+  const groups = new Map<string, SecurityEvent[]>();
+  attackEvents.forEach((event) => {
+    const key = [
+      event.attackCategory || "unclassified",
+      event.attackSubtype || "",
+      event.toolSignature || "",
+      event.behaviorFingerprint || "",
+      event.ruleId || "",
+      event.ruleName || "",
+    ].join("|");
+    groups.set(key, [...(groups.get(key) ?? []), event]);
+  });
+
+  const items = Array.from(groups.entries())
+    .map(([key, group]) => {
+      const ordered = [...group].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+      const newest = [...group].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+      const firstSeen = ordered[0]?.timestamp ?? "";
+      const lastSeen = ordered[ordered.length - 1]?.timestamp ?? firstSeen;
+      const attackCategory = mostUsed(group.map((event) => event.attackCategory || event.eventType), "unknown");
+      const attackSubtype = mostUsed(group.map((event) => event.attackSubtype || event.eventType), attackCategory);
+      const confidence = group.length ? group.reduce((sum, event) => sum + event.confidence, 0) / group.length : 0;
+      const source = countItems(group.map((event) => event.clientIp), 1)[0]?.label;
+      const sourceEvent = group.find((event) => event.clientIp === source) ?? group[0];
+      const path = countItems(group.map((event) => `${event.method}|${event.path}|${event.statusCode}`), 1)[0];
+      const [method = "", pathValue = "", statusValue = "0"] = (path?.label ?? "").split("|");
+      const action = countItems(group.map((event) => event.action), 1)[0];
+      const userAgent = countItems(group.map((event) => event.userAgent), 1)[0];
+      const ruleId = mostUsed(group.map((event) => event.ruleId), "");
+
+      return {
+        clusterId: `cluster-${key.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || newest[0]?.id || "unknown"}`,
+        attackCategory,
+        attackSubtype,
+        ruleId,
+        ruleName: mostUsed(group.map((event) => event.ruleName), ""),
+        toolSignature: mostUsed(group.map((event) => event.toolSignature || event.userAgent), ""),
+        behaviorFingerprint: mostUsed(group.map((event) => event.behaviorFingerprint), ""),
+        eventCount: group.length,
+        riskLevel: maxRiskLevel(group),
+        confidence: Number(confidence.toFixed(3)),
+        timeRange: {
+          firstSeen,
+          lastSeen,
+        },
+        primarySource: sourceEvent
+          ? {
+              clientIp: sourceEvent.clientIp,
+              country: sourceEvent.country,
+              region: sourceEvent.region,
+              city: sourceEvent.city,
+              asn: sourceEvent.asn,
+              latitude: sourceEvent.latitude,
+              longitude: sourceEvent.longitude,
+              locationPrecision: sourceEvent.locationPrecision,
+              count: countItems(group.map((event) => event.clientIp), 1)[0]?.value ?? 0,
+            }
+          : null,
+        primaryPath: path
+          ? {
+              method,
+              path: pathValue,
+              statusCode: Number(statusValue),
+              count: path.value,
+            }
+          : null,
+        primaryAction: action ? { action: action.label, count: action.value } : null,
+        primaryUserAgent: userAgent ? { userAgent: userAgent.label, count: userAgent.value } : null,
+        countries: countItems(group.map((event) => event.country)),
+        paths: countItems(group.map((event) => event.path)),
+        methods: countItems(group.map((event) => event.method)),
+        statusCodes: countItems(group.map((event) => event.statusCode)),
+        actions: countItems(group.map((event) => event.action)),
+        userAgents: countItems(group.map((event) => event.userAgent), 5),
+        evidence: newest.slice(0, 5).map(eventEvidence),
+      };
+    })
+    .sort((a, b) => riskRankValue(b.riskLevel) - riskRankValue(a.riskLevel) || b.eventCount - a.eventCount);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    filters: defaultAnalysisFilters(),
+    totalClusters: items.length,
+    items,
+  };
+}
+
+export function createAnalysisRules(events: SecurityEvent[] = createSampleSecurityData().events): AnalysisRulesResult {
+  const definitions = baseRuleDefinitions();
+  const stats = new Map<string, AnalysisRule & { sourceSet: Set<string>; pathSet: Set<string> }>();
+  events.forEach((event) => {
+    eventRuleHits(event).forEach((hit) => {
+      const definition = definitions[hit.id];
+      const current = stats.get(hit.id);
+      if (current) {
+        current.eventCount += 1;
+        current.riskLevel = riskRankValue(event.riskLevel) > riskRankValue(current.riskLevel) ? event.riskLevel : current.riskLevel;
+        current.firstSeen = Date.parse(event.timestamp) < Date.parse(current.firstSeen) ? event.timestamp : current.firstSeen;
+        current.lastSeen = Date.parse(event.timestamp) > Date.parse(current.lastSeen) ? event.timestamp : current.lastSeen;
+        current.sourceSet.add(event.clientIp);
+        current.pathSet.add(event.path);
+        if (current.evidence.length < 5) current.evidence.push(eventEvidence(event));
+      } else {
+        stats.set(hit.id, {
+          ruleId: hit.id,
+          ruleName: hit.name || definition?.name || hit.id,
+          eventCount: 1,
+          riskLevel: event.riskLevel,
+          severity: hit.severity || definition?.severity || event.riskLevel,
+          mode: hit.mode || definition?.mode || "observe",
+          version: event.ruleVersion || definition?.version || "",
+          attackCategory: event.attackCategory || definition?.classification.attackCategory || "",
+          attackSubtype: event.attackSubtype || definition?.classification.attackSubtype || "",
+          firstSeen: event.timestamp,
+          lastSeen: event.timestamp,
+          sourceCount: 1,
+          pathCount: 1,
+          matchedFields: [],
+          matchedValues: countItems(hit.evidence, 8),
+          definition,
+          evidence: [eventEvidence(event)],
+          sourceSet: new Set([event.clientIp]),
+          pathSet: new Set([event.path]),
+        });
+      }
+    });
+  });
+
+  const items = Array.from(stats.values()).map(({ sourceSet, pathSet, ...item }) => ({
+    ...item,
+    sourceCount: sourceSet.size,
+    pathCount: pathSet.size,
+  }));
+  items.sort((a, b) => riskRankValue(b.riskLevel) - riskRankValue(a.riskLevel) || b.eventCount - a.eventCount);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    filters: defaultAnalysisFilters(),
+    totalRules: items.length,
+    items,
+  };
+}
+
+export function createAnalysisSources(overview: SecurityOverview = createSampleSecurityData().overview): AnalysisSources {
+  const attackEvents = overview.recentEvents.filter((event) => resolveTrafficKind(event) === "attack" || riskRankValue(event.riskLevel) >= riskRankValue("medium"));
+  const groups = new Map<string, { events: SecurityEvent[]; requestCount: number }>();
+  overview.topIps.forEach((item) => groups.set(item.label, { events: [], requestCount: item.value }));
+  attackEvents.forEach((event) => {
+    const key = event.clientIp || event.id;
+    const current = groups.get(key) ?? { events: [], requestCount: 0 };
+    current.events.push(event);
+    current.requestCount = Math.max(current.requestCount, current.events.length);
+    groups.set(key, current);
+  });
+  const items = Array.from(groups.entries())
+    .map(([clientIp, data]) => {
+      const latest = [...data.events].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))[0];
+      const requestCount = Math.max(data.requestCount, data.events.length);
+      const attackCount = data.events.length;
+      return {
+        clientIp,
+        country: latest?.country ?? "",
+        region: latest?.region ?? "",
+        city: latest?.city ?? "",
+        latitude: latest?.latitude ?? 0,
+        longitude: latest?.longitude ?? 0,
+        locationPrecision: latest?.locationPrecision ?? "estimated",
+        requestCount,
+        attackCount,
+        normalCount: Math.max(0, requestCount - attackCount),
+        attackShare: requestCount ? Number((attackCount / requestCount).toFixed(4)) : 0,
+        riskLevel: data.events.length ? maxRiskLevel(data.events) : "info",
+        latestSeen: latest?.timestamp,
+        topAttackCategory: mostUsed(data.events.map((event) => event.attackCategory || event.eventType), ""),
+        topRuleId: mostUsed(data.events.map((event) => event.ruleId), ""),
+        topPath: mostUsed(data.events.map((event) => event.path), ""),
+      };
+    })
+    .sort((a, b) => b.attackCount - a.attackCount || b.requestCount - a.requestCount);
+  const countryRequests = new Map(overview.countries.map((item) => [item.label, item.value]));
+  const countryAttacks = new Map<string, SecurityEvent[]>();
+  attackEvents.forEach((event) => countryAttacks.set(event.country, [...(countryAttacks.get(event.country) ?? []), event]));
+  const countries = Array.from(new Set([...countryRequests.keys(), ...countryAttacks.keys()]))
+    .map((country) => {
+      const eventsForCountry = countryAttacks.get(country) ?? [];
+      const requestCount = Math.max(countryRequests.get(country) ?? 0, eventsForCountry.length);
+      const attackCount = eventsForCountry.length;
+      return {
+        country,
+        requestCount,
+        attackCount,
+        normalCount: Math.max(0, requestCount - attackCount),
+        attackShare: requestCount ? Number((attackCount / requestCount).toFixed(4)) : 0,
+        riskLevel: eventsForCountry.length ? maxRiskLevel(eventsForCountry) : "info",
+      };
+    })
+    .sort((a, b) => b.attackCount - a.attackCount || b.requestCount - a.requestCount);
+  const totalRequests = countries.reduce((sum, item) => sum + item.requestCount, 0);
+  const totalAttackEvents = attackEvents.length;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    filters: defaultAnalysisFilters(),
+    totalRequests,
+    totalAttackEvents,
+    normalRequests: Math.max(0, totalRequests - totalAttackEvents),
+    attackShare: totalRequests ? Number((totalAttackEvents / totalRequests).toFixed(4)) : 0,
+    affectedSources: new Set(attackEvents.map((event) => event.clientIp).filter(Boolean)).size,
+    affectedCountries: new Set(attackEvents.map((event) => event.country).filter(Boolean)).size,
+    items,
+    countries,
+  };
+}
+
+export function createAnalysisAdvice(clusters: AnalysisClustersResult = createAnalysisClusters()): AnalysisAdviceResult {
+  const items = clusters.items.slice(0, 4).map((cluster) => {
+    const ruleType = cluster.primaryPath?.path ? "path_keyword" : cluster.primaryUserAgent?.userAgent ? "user_agent_keyword" : "cloudflare_action";
+    const condition =
+      ruleType === "path_keyword"
+        ? { keywords: cluster.primaryPath?.path ? [cluster.primaryPath.path] : [] }
+        : ruleType === "user_agent_keyword"
+          ? { keywords: cluster.primaryUserAgent?.userAgent ? [cluster.primaryUserAgent.userAgent] : [] }
+          : { actions: cluster.primaryAction?.action ? [cluster.primaryAction.action] : [] };
+    return {
+      id: `draft-${cluster.clusterId}`,
+      status: "draft",
+      sourceClusterId: cluster.clusterId,
+      title: `Review rule for ${cluster.attackCategory}`,
+      riskLevel: cluster.riskLevel,
+      confidence: cluster.confidence,
+      rationale: `${cluster.eventCount} events share rule, action, source, path, or tool evidence.`,
+      impact: {
+        eventCount: cluster.eventCount,
+        sourceCount: cluster.countries.length,
+        pathCount: cluster.paths.length,
+        timeRange: cluster.timeRange,
+      },
+      ruleDraft: {
+        id: `draft-${cluster.clusterId}`,
+        version: "draft",
+        name: `Review ${cluster.attackCategory}`,
+        enabled: false,
+        mode: "shadow",
+        ruleType,
+        condition,
+        severity: cluster.riskLevel,
+        classification: {
+          attackCategory: cluster.attackCategory,
+          attackSubtype: cluster.attackSubtype,
+          toolSignature: cluster.toolSignature,
+          behaviorFingerprint: cluster.behaviorFingerprint,
+        },
+        actions: {
+          alert: true,
+          block: false,
+        },
+        lifecycle: {
+          createdBy: "attack_aggregator",
+          reviewStatus: "manual_review_required",
+        },
+      },
+      evidence: cluster.evidence,
+      manualReviewQuestions: [
+        "Confirm whether the primary path is expected production traffic.",
+        "Confirm whether the source countries and user agents match known legitimate clients.",
+        "Confirm the rule mode before enabling enforcement.",
+      ],
+    };
+  });
+
+  return {
+    status: "draft",
+    message: "Rule advice is generated from aggregate data only. No large model was called.",
+    generatedAt: new Date().toISOString(),
+    filters: defaultAnalysisFilters(),
+    totalDrafts: items.length,
+    items,
+  };
 }

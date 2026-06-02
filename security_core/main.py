@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
+from .attack_aggregator import AnalysisFilters, AttackAggregator
 from .cloudflare_client import CloudflareClient, CloudflareClientError
 from .config import DEFAULT_ALLOWED_ORIGINS, WORKER_LOG_EXPORT_TOKEN, WORKER_LOG_EXPORT_URL
 from .database import init_db, utc_now
@@ -75,6 +76,22 @@ def token_check_state(check: dict[str, Any], *, sample_mode: bool = False) -> di
         "cloudflareLive": False,
         "message": check.get("errorMessage") or "Cloudflare token check failed.",
     }
+
+
+def build_analysis_filters(
+    time_range: str | None,
+    risk: str | None,
+    country: str | None,
+    attack_category: str | None,
+    rule_id: str | None,
+) -> AnalysisFilters:
+    return AnalysisFilters(
+        time_range=time_range,
+        risk=risk,
+        country=country,
+        attack_category=attack_category,
+        rule_id=rule_id,
+    )
 
 
 def configured_origins() -> set[str]:
@@ -179,6 +196,8 @@ def events(
     risk: str | None = None,
     event_type: str | None = Query(None, alias="event_type"),
     event_type_camel: str | None = Query(None, alias="eventType"),
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
     action: str | None = None,
     path: str | None = None,
     user_agent: str | None = Query(None, alias="userAgent"),
@@ -204,6 +223,8 @@ def events(
         "risk_level": risk_value,
         "risk_at_or_above": bool(risk and not explicit_risk_level and risk in {"high", "high+"}),
         "event_type": event_type or event_type_camel,
+        "attack_category": attack_category,
+        "rule_id": rule_id,
         "action": action,
         "path": path,
         "user_agent": user_agent,
@@ -412,19 +433,64 @@ def rules() -> dict[str, Any]:
 
 
 @app.get("/api/analysis/summary")
-def analysis_summary() -> dict[str, Any]:
-    overview_data = get_overview()
-    sync = overview_data["sync"]
-    return api_success(
-        {
-            "status": "reserved",
-            "message": "AI analysis is reserved. Current summary is generated from rule matching and Cloudflare aggregates.",
-            "generatedAt": overview_data["generatedAt"],
-            "items": [
-                {"label": "mode", "value": sync.get("mode") or sync.get("status"), "detail": "Current data source mode"},
-                {"label": "events", "value": sync["localEventCount"], "detail": "Stored event rows"},
-                {"label": "aggregates", "value": sync["aggregateCount"], "detail": "Stored aggregate rows"},
-                {"label": "sources", "value": len(overview_data["globePoints"]), "detail": "Visible source points"},
-            ],
-        }
-    )
+def analysis_summary(
+    time_range: str | None = Query("24h", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(AttackAggregator().summary(filters))
+
+
+@app.get("/api/analysis/clusters")
+def analysis_clusters(
+    time_range: str | None = Query("24h", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+    limit: int = 50,
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(AttackAggregator().clusters(filters, limit=limit))
+
+
+@app.get("/api/analysis/rules")
+def analysis_rules(
+    time_range: str | None = Query("24h", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+    limit: int = 50,
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(AttackAggregator().rules(filters, limit=limit))
+
+
+@app.get("/api/analysis/sources")
+def analysis_sources(
+    time_range: str | None = Query("24h", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+    limit: int = 50,
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(AttackAggregator().sources(filters, limit=limit))
+
+
+@app.get("/api/analysis/advice")
+def analysis_advice(
+    time_range: str | None = Query("24h", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+    limit: int = 10,
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(AttackAggregator().advice(filters, limit=limit))

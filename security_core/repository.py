@@ -743,12 +743,16 @@ def get_sync_status() -> dict[str, Any]:
 
 def get_counts() -> tuple[int, int]:
     source_clause, source_params = active_source_filter()
-    aggregate_prefix = "sample:%" if is_sample_mode() else "cloudflare:%"
+    aggregate_prefixes = ["sample:%"] if is_sample_mode() else ["cloudflare:%", "worker_log:%"]
     with db_session() as connection:
         events = connection.execute(f"SELECT COUNT(*) AS count FROM raw_events WHERE {source_clause}", source_params).fetchone()["count"]
         aggregates = connection.execute(
-            "SELECT COUNT(*) AS count FROM event_aggregates WHERE dimension LIKE ?",
-            (aggregate_prefix,),
+            f"""
+            SELECT COUNT(*) AS count
+            FROM event_aggregates
+            WHERE {" OR ".join("dimension LIKE ?" for _ in aggregate_prefixes)}
+            """,
+            aggregate_prefixes,
         ).fetchone()["count"]
     return int(events), int(aggregates)
 
@@ -788,6 +792,13 @@ def _event_filter_sql(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     if _has_filter(filters.get("event_type")):
         clauses.append("event_type = ?")
         params.append(str(filters["event_type"]).strip())
+    if _has_filter(filters.get("attack_category")):
+        clauses.append("attack_category = ?")
+        params.append(str(filters["attack_category"]).strip())
+    if _has_filter(filters.get("rule_id")):
+        clauses.append("(rule_id = ? OR rule_hits_json LIKE ?)")
+        rule_id = str(filters["rule_id"]).strip()
+        params.extend([rule_id, f"%{rule_id}%"])
     if _has_filter(filters.get("action")):
         clauses.append("action = ?")
         params.append(str(filters["action"]).strip())

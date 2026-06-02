@@ -1,5 +1,13 @@
 import {
+  createAnalysisAdvice,
+  createAnalysisClusters,
+  createAnalysisRules,
+  createAnalysisSources,
   createSampleSecurityData,
+  type AnalysisAdviceResult,
+  type AnalysisClustersResult,
+  type AnalysisRulesResult,
+  type AnalysisSources,
   type SecurityEvent,
   type SecurityDataMode,
   type SecurityOverview,
@@ -29,6 +37,8 @@ export type SecurityEventQuery = {
   method?: string;
   action?: string;
   statusCode?: string;
+  attackCategory?: string;
+  ruleId?: string;
   timeRange?: string;
   limit?: number;
   offset?: number;
@@ -218,6 +228,8 @@ function sampleMatchesQuery(event: SecurityEvent, query: SecurityEventQuery) {
   if (query.action && event.action !== query.action) return false;
   if (query.method && event.method !== query.method) return false;
   if (query.statusCode && String(event.statusCode) !== String(query.statusCode)) return false;
+  if (query.attackCategory && event.attackCategory !== query.attackCategory) return false;
+  if (query.ruleId && event.ruleId !== query.ruleId && !event.ruleHits?.some((rule) => rule.id === query.ruleId)) return false;
   if (query.ip && !event.clientIp.toLowerCase().includes(query.ip.toLowerCase())) return false;
   if (query.country && !`${event.country} ${event.region} ${event.city}`.toLowerCase().includes(query.country.toLowerCase())) return false;
   if (query.region && !`${event.region} ${event.city}`.toLowerCase().includes(query.region.toLowerCase())) return false;
@@ -350,6 +362,27 @@ export async function getSecuritySyncStatus(): Promise<SecurityApiResult<SyncSta
 
 export async function getAnalysisSummary(): Promise<SecurityApiResult<AnalysisSummary | null>> {
   return fetchWithFallback<AnalysisSummary | null>("/api/analysis/summary", null);
+}
+
+export async function getAnalysisClusters(): Promise<SecurityApiResult<AnalysisClustersResult>> {
+  const sample = createSampleSecurityData();
+  return fetchWithFallback("/api/analysis/clusters", createAnalysisClusters(sample.events));
+}
+
+export async function getAnalysisRules(): Promise<SecurityApiResult<AnalysisRulesResult>> {
+  const sample = createSampleSecurityData();
+  return fetchWithFallback("/api/analysis/rules", createAnalysisRules(sample.events));
+}
+
+export async function getAnalysisSources(): Promise<SecurityApiResult<AnalysisSources>> {
+  const sample = createSampleSecurityData();
+  return fetchWithFallback("/api/analysis/sources", createAnalysisSources(sample.overview));
+}
+
+export async function getAnalysisAdvice(): Promise<SecurityApiResult<AnalysisAdviceResult>> {
+  const sample = createSampleSecurityData();
+  const clusters = createAnalysisClusters(sample.events);
+  return fetchWithFallback("/api/analysis/advice", createAnalysisAdvice(clusters));
 }
 
 export async function saveCloudflareSettings(payload: CloudflareSettingsPayload): Promise<SecurityApiResult<TokenCheckApiResult>> {
