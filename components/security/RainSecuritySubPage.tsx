@@ -6,6 +6,7 @@ import { useMemo, useState, useTransition } from "react";
 import {
   checkCloudflareToken,
   runSecuritySync,
+  runWorkerLogSync,
   saveCloudflareSettings,
   updateRiskThreshold,
   type TokenCheckApiResult,
@@ -13,6 +14,7 @@ import {
 import { SecurityGlobalNav } from "@/components/security/SecurityGlobalNav";
 import { useRainCursor } from "@/components/security/useRainCursor";
 import { resolveTrafficKind } from "@/lib/security-data";
+import { formatCountryDisplayName } from "@/lib/security-locale";
 import type { PermissionCheck, RiskLevel, SecurityDataMode, SecurityEvent, SecurityRuleHit, SecuritySettings, SyncStatus } from "@/lib/security-data";
 
 export type EventInitialFilters = {
@@ -72,11 +74,20 @@ const riskRank: Record<RiskLevel, number> = {
 };
 
 const riskText: Record<RiskLevel, string> = {
-  info: "INFO",
-  low: "LOW",
-  medium: "WATCH",
-  high: "HIGH",
-  critical: "CRIT",
+  info: "信息",
+  low: "低",
+  medium: "关注",
+  high: "高",
+  critical: "严重",
+};
+
+const riskOptionText: Record<"all" | RiskLevel, string> = {
+  all: "全部",
+  info: "信息 (info)",
+  low: "低 (low)",
+  medium: "关注 (medium)",
+  high: "高 (high)",
+  critical: "严重 (critical)",
 };
 
 const riskOptions: Array<"all" | RiskLevel> = ["all", "info", "low", "medium", "high", "critical"];
@@ -95,7 +106,6 @@ const pageCopy = {
     eyebrow: "SECURITY / CONTROL ROOM",
     title: "Security Config",
     subtitle: "配置 Cloudflare 只读接入、同步周期、提醒阈值与本地数据保留策略。",
-    active: "settings" as const,
     index: "03",
   },
 };
@@ -139,9 +149,20 @@ function formatTime(timestamp: string) {
   }).format(date);
 }
 
+function localizedCountryName(value?: string) {
+  return formatCountryDisplayName(value) || "N/A";
+}
+
+function localizedPlaceName(country?: string, locality?: string) {
+  const displayLocality = locality?.trim();
+  if (!country?.trim()) return displayLocality || "N/A";
+  const displayCountry = localizedCountryName(country);
+  if (!displayLocality) return displayCountry;
+  return `${displayCountry} / ${displayLocality}`;
+}
+
 function eventMatchesRisk(event: SecurityEvent, risk: FilterState["risk"]) {
   if (risk === "all") return true;
-  if (risk === "high") return event.riskLevel === "high" || event.riskLevel === "critical";
   return event.riskLevel === risk;
 }
 
@@ -196,40 +217,55 @@ function resolveDataMode(source: "api" | "sample", error?: string, syncStatus?: 
   return "sample";
 }
 
-function modeCopy(mode: SecurityDataMode, syncStatus?: SyncStatus): ModeCopy {
+function modeCopy(mode: SecurityDataMode | "worker_log", syncStatus?: Pick<SyncStatus, "apiError">): ModeCopy {
+  if (mode === "worker_log") {
+    return {
+      label: "Worker/D1",
+      detail: syncStatus?.apiError || "Worker/D1 access log sync is available.",
+      tone: "live",
+    };
+  }
   if (mode === "live") {
     return {
-      label: "LIVE",
-      detail: "Cloudflare 实时同步可用，当前数据来自后端 live 模式。",
+      label: "实时",
+      detail: "Cloudflare 实时同步可用，当前数据来自后端实时模式。",
       tone: "live",
     };
   }
   if (mode === "stale") {
     return {
-      label: "STALE",
+      label: "旧数据",
       detail: "同步失败，当前展示上次成功保留的旧数据。",
       tone: "stale",
     };
   }
   if (mode === "degraded") {
     return {
-      label: "DEGRADED",
+      label: "降级",
       detail: syncStatus?.apiError || "Cloudflare 校验或同步失败，页面保留可读数据。",
       tone: "degraded",
     };
   }
   if (mode === "mock" || mode === "mock-cloudflare") {
     return {
-      label: mode === "mock-cloudflare" ? "MOCK-CF" : "MOCK",
+      label: mode === "mock-cloudflare" ? "本地模拟 Cloudflare" : "本地模拟",
       detail: "Token 格式通过，本阶段未调用 Cloudflare，展示结构等价同步数据。",
       tone: "mock",
     };
   }
   return {
-    label: "SAMPLE",
+    label: "样例",
     detail: "未接入后端或未配置 Token，当前展示样例数据。",
     tone: "sample",
   };
+}
+
+function tokenCheckStatusText(status: TokenCheckApiResult["tokenCheck"]["status"]) {
+  if (status === "success") return "通过";
+  if (status === "failed") return "失败";
+  if (status === "partial") return "部分通过";
+  if (status === "degraded") return "降级";
+  return status;
 }
 
 function HudMetric({ label, value }: { label: string; value: string }) {
@@ -253,13 +289,15 @@ function FieldLabel({ label, children }: { label: string; children: React.ReactN
 function EventAlertText({ event }: { event: SecurityEvent | null }) {
   const [copied, setCopied] = useState(false);
   const text = event
-    ? `[Security Studio] ${event.riskLevel.toUpperCase()} ${event.eventType}
-Source: ${event.clientIp} / ${event.country} ${event.city}
-Request: ${event.method} ${event.path}
-Action: ${event.action}
-Ray: ${event.rayId || "N/A"}
-Open: /security/events/${event.id}`
-    : "SELECT EVENT";
+    ? `[Security Studio] ${event.riskLevel.toUpperCase()} / ${event.eventType}
+LOCK: ${event.id}
+SOURCE: ${event.clientIp} / ${localizedPlaceName(event.country, event.city || event.region)}
+REQUEST: ${event.method} ${event.path}
+ACTION: ${event.action}
+RULE: ${ruleHitSummary(event)}
+RAY: ${event.rayId || "N/A"}
+LINK: /security/events/${event.id}`
+    : "请选择事件";
 
   const copyText = async () => {
     await navigator.clipboard?.writeText(text);
@@ -268,11 +306,11 @@ Open: /security/events/${event.id}`
   };
 
   return (
-    <div className="rain-template-block">
-      <span>ALERT TEXT / PENDING CHANNEL</span>
+    <div className="rain-template-block rain-alert-command">
+      <span>COMMAND / ALERT BUFFER</span>
       <pre className="rain-raw-json">{text}</pre>
       <button type="button" onClick={copyText}>
-        {copied ? "COPIED" : "COPY TEXT"}
+        {copied ? "BUFFER COPIED" : "复制告警文本"}
       </button>
     </div>
   );
@@ -292,7 +330,7 @@ function normalizeRuleHit(hit: SecurityRuleHit | Record<string, unknown>, event:
   const matchedField = stringValue(raw.matchedField);
   const matchedValue = stringValue(raw.matchedValue);
   const evidence = stringArray(raw.evidence);
-  const generatedEvidence = matchedField || matchedValue ? [`${matchedField || "field"}=${matchedValue || "matched"}`] : fallbackEvidence;
+  const generatedEvidence = matchedField || matchedValue ? [`${matchedField || "字段"}=${matchedValue || "命中"}`] : fallbackEvidence;
   const classification =
     stringValue(raw.classification) ||
     [stringValue(raw.attackCategory), stringValue(raw.attackSubtype)].filter(Boolean).join(" / ") ||
@@ -300,7 +338,7 @@ function normalizeRuleHit(hit: SecurityRuleHit | Record<string, unknown>, event:
 
   return {
     id: stringValue(raw.id) || stringValue(raw.ruleId) || event.ruleId || "unmapped-rule",
-    name: stringValue(raw.name) || stringValue(raw.ruleName) || event.ruleName || "Unmapped rule",
+    name: stringValue(raw.name) || stringValue(raw.ruleName) || event.ruleName || "未映射规则",
     mode,
     severity: stringValue(raw.severity) || event.riskLevel,
     classification,
@@ -317,7 +355,7 @@ function eventRuleHits(event: SecurityEvent): SecurityRuleHit[] {
   return [
     {
       id: event.ruleId || "unmapped-rule",
-      name: event.ruleName || "Unmapped rule",
+      name: event.ruleName || "未映射规则",
       mode: "observe",
       severity: event.riskLevel,
       classification: event.eventType,
@@ -336,8 +374,8 @@ function primaryRuleHit(event: SecurityEvent) {
 function ruleHitSummary(event: SecurityEvent) {
   const hits = eventRuleHits(event);
   const primary = hits.find((hit) => hit.matched) ?? hits[0];
-  if (!primary) return "NO RULE";
-  return hits.length > 1 ? `${hits.length} RULES / ${primary.name}` : primary.name;
+  if (!primary) return "无规则";
+  return hits.length > 1 ? `${hits.length} 条规则 / ${primary.name}` : primary.name;
 }
 
 function toolSummary(event: SecurityEvent) {
@@ -349,7 +387,7 @@ function eventTrafficKind(event: SecurityEvent) {
 }
 
 function eventKindText(event: SecurityEvent) {
-  return eventTrafficKind(event) === "visit" ? "VISIT" : "ATTACK";
+  return eventTrafficKind(event) === "visit" ? "访问" : "攻击";
 }
 
 function eventDisplayCategory(event: SecurityEvent) {
@@ -357,7 +395,17 @@ function eventDisplayCategory(event: SecurityEvent) {
 }
 
 function compactEventLine(event: SecurityEvent) {
-  return `${event.method} ${event.path} / ${eventKindText(event)}: ${eventDisplayCategory(event)} / ${ruleHitSummary(event)}`;
+  return `${event.method} ${event.path} / 流量类型: ${eventKindText(event)} / ${eventDisplayCategory(event)} / ${ruleHitSummary(event)}`;
+}
+
+function eventEvidenceItems(event: SecurityEvent) {
+  return [
+    `request=${event.method} ${event.path}${event.query ? `?${event.query}` : ""}`,
+    `status=${event.statusCode}`,
+    `action=${event.action}`,
+    `source=${event.clientIp}`,
+    `ray=${event.rayId || "N/A"}`,
+  ];
 }
 
 function RainEventConsole({
@@ -407,10 +455,14 @@ function RainEventConsole({
     () => events.filter((event) => eventMatchesFilters(event, filters)).sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)),
     [events, filters],
   );
+  const highMetricEvents = useMemo(() => {
+    const filtersWithoutRisk: FilterState = { ...filters, risk: "all" };
+    return events.filter((event) => eventMatchesFilters(event, filtersWithoutRisk));
+  }, [events, filters]);
   const selectedEvent = visibleEvents.find((event) => event.id === selectedId) ?? visibleEvents[0] ?? null;
   const selectedRuleHits = selectedEvent ? eventRuleHits(selectedEvent) : [];
   const selectedPrimaryRule = selectedEvent ? primaryRuleHit(selectedEvent) : null;
-  const highCount = visibleEvents.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length;
+  const highCount = highMetricEvents.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length;
   const blockedCount = visibleEvents.filter((event) => event.action === "block" || event.action === "managed_challenge").length;
   const dataMode = resolveDataMode(source, error, syncStatus);
   const dataModeInfo = modeCopy(dataMode, syncStatus);
@@ -434,121 +486,139 @@ function RainEventConsole({
 
   return (
     <div className="rain-console-grid rain-event-console">
-      <aside className="rain-console-spine" aria-label="事件筛选">
-        <p>FILTER SYSTEM</p>
-        <HudMetric label="MATCHED" value={String(visibleEvents.length)} />
-        <HudMetric label="HIGH+" value={String(highCount)} />
-        <HudMetric label="CONTAINED" value={String(blockedCount)} />
-        <HudMetric label="MODE" value={dataModeInfo.label} />
+      <aside className="rain-console-spine rain-filter-panel" aria-label="事件筛选">
+        <div className="rain-filter-head">
+          <span>FILTER CONTROL</span>
+          <strong>SCAN LOCK</strong>
+        </div>
+        <div className="rain-filter-metrics">
+          <HudMetric label="匹配事件" value={String(visibleEvents.length)} />
+          <HudMetric label="高危锁定" value={String(highCount)} />
+          <HudMetric label="已处置" value={String(blockedCount)} />
+          <HudMetric label="数据链路" value={dataModeInfo.label} />
+        </div>
         <div className="rain-mode-note" data-mode={dataModeInfo.tone}>
           <strong>{dataModeInfo.label}</strong>
           <span>{dataModeInfo.detail}</span>
         </div>
 
-        <FieldLabel label="TIME WINDOW">
-          <select value={filters.timeRange} onChange={(event) => updateFilter("timeRange", event.target.value as FilterState["timeRange"])}>
-            <option value="6h">6H</option>
-            <option value="24h">24H</option>
-            <option value="7d">7D</option>
-            <option value="all">ALL LOCAL</option>
-          </select>
-        </FieldLabel>
+        <div className="rain-filter-section">
+          <span>01 / TIME + RISK</span>
+          <FieldLabel label="时间范围">
+            <select value={filters.timeRange} onChange={(event) => updateFilter("timeRange", event.target.value as FilterState["timeRange"])}>
+              <option value="6h">近 6 小时</option>
+              <option value="24h">近 24 小时</option>
+              <option value="7d">近 7 天</option>
+              <option value="all">全部本地</option>
+            </select>
+          </FieldLabel>
 
-        <FieldLabel label="RISK LEVEL">
-          <select value={filters.risk} onChange={(event) => updateFilter("risk", event.target.value as FilterState["risk"])}>
-            {riskOptions.map((risk) => (
-              <option key={risk} value={risk}>
-                {risk.toUpperCase()}
-              </option>
-            ))}
-          </select>
-        </FieldLabel>
-
-        <FieldLabel label="EVENT TYPE">
-          <select value={filters.eventType} onChange={(event) => updateFilter("eventType", event.target.value)}>
-            <option value="all">ALL TYPES</option>
-            {eventTypes.map((eventType) => (
-              <option key={eventType} value={eventType}>
-                {eventType}
-              </option>
-            ))}
-          </select>
-        </FieldLabel>
-
-        <FieldLabel label="ATTACK CATEGORY">
-          <select value={filters.attackCategory} onChange={(event) => updateFilter("attackCategory", event.target.value)}>
-            <option value="">ALL CATEGORIES</option>
-            {attackCategories.map((attackCategory) => (
-              <option key={attackCategory} value={attackCategory}>
-                {attackCategory}
-              </option>
-            ))}
-          </select>
-        </FieldLabel>
-
-        <FieldLabel label="RULE ID">
-          <input value={filters.ruleId} placeholder="builtin-sensitive-path" onChange={(event) => updateFilter("ruleId", event.target.value)} />
-        </FieldLabel>
-
-        <FieldLabel label="SOURCE IP">
-          <input value={filters.ip} placeholder="185.220" onChange={(event) => updateFilter("ip", event.target.value)} />
-        </FieldLabel>
-        <FieldLabel label="COUNTRY / REGION">
-          <input value={filters.country} placeholder="Frankfurt / Germany" onChange={(event) => updateFilter("country", event.target.value)} />
-        </FieldLabel>
-        <FieldLabel label="PATH / QUERY">
-          <input value={filters.path} placeholder=".env / admin" onChange={(event) => updateFilter("path", event.target.value)} />
-        </FieldLabel>
-        <FieldLabel label="USER AGENT">
-          <input value={filters.userAgent} placeholder="curl / scanner" onChange={(event) => updateFilter("userAgent", event.target.value)} />
-        </FieldLabel>
-
-        <div className="rain-console-row-controls">
-          <label>
-            <span>METHOD</span>
-            <select value={filters.method} onChange={(event) => updateFilter("method", event.target.value)}>
-              {methodOptions.map((method) => (
-                <option key={method} value={method}>
-                  {method}
+          <FieldLabel label="风险等级">
+            <select value={filters.risk} onChange={(event) => updateFilter("risk", event.target.value as FilterState["risk"])}>
+              {riskOptions.map((risk) => (
+                <option key={risk} value={risk}>
+                  {riskOptionText[risk]}
                 </option>
               ))}
             </select>
-          </label>
-          <label>
-            <span>STATUS</span>
-            <input value={filters.statusCode} placeholder="403" onChange={(event) => updateFilter("statusCode", event.target.value.replace(/\D/g, "").slice(0, 3))} />
-          </label>
+          </FieldLabel>
         </div>
 
-        <FieldLabel label="CLOUDFLARE ACTION">
-          <select value={filters.action} onChange={(event) => updateFilter("action", event.target.value)}>
-            {actionOptions.map((action) => (
-              <option key={action} value={action}>
-                {action.toUpperCase()}
-              </option>
-            ))}
-          </select>
-        </FieldLabel>
+        <div className="rain-filter-section">
+          <span>02 / RULE TRACE</span>
+          <FieldLabel label="事件类型">
+            <select value={filters.eventType} onChange={(event) => updateFilter("eventType", event.target.value)}>
+              <option value="all">全部类型</option>
+              {eventTypes.map((eventType, index) => (
+                <option key={`${eventType}:eventType:${index}`} value={eventType}>
+                  {eventType}
+                </option>
+              ))}
+            </select>
+          </FieldLabel>
+
+          <FieldLabel label="攻击分类">
+            <select value={filters.attackCategory} onChange={(event) => updateFilter("attackCategory", event.target.value)}>
+              <option value="">全部分类</option>
+              {attackCategories.map((attackCategory, index) => (
+                <option key={`${attackCategory}:attackCategory:${index}`} value={attackCategory}>
+                  {attackCategory}
+                </option>
+              ))}
+            </select>
+          </FieldLabel>
+
+          <FieldLabel label="规则 ID">
+            <input value={filters.ruleId} placeholder="builtin-sensitive-path" onChange={(event) => updateFilter("ruleId", event.target.value)} />
+          </FieldLabel>
+        </div>
+
+        <div className="rain-filter-section">
+          <span>03 / SOURCE READBACK</span>
+          <FieldLabel label="源 IP">
+            <input value={filters.ip} placeholder="185.220" onChange={(event) => updateFilter("ip", event.target.value)} />
+          </FieldLabel>
+          <FieldLabel label="国家 / 地区">
+            <input value={filters.country} placeholder="JP / 日本 / Tokyo" onChange={(event) => updateFilter("country", event.target.value)} />
+          </FieldLabel>
+          <FieldLabel label="path / query">
+            <input value={filters.path} placeholder=".env / admin" onChange={(event) => updateFilter("path", event.target.value)} />
+          </FieldLabel>
+          <FieldLabel label="User-Agent">
+            <input value={filters.userAgent} placeholder="curl / scanner" onChange={(event) => updateFilter("userAgent", event.target.value)} />
+          </FieldLabel>
+        </div>
+
+        <div className="rain-filter-section">
+          <span>04 / EDGE ACTION</span>
+          <div className="rain-console-row-controls">
+            <label>
+              <span>HTTP 方法</span>
+              <select value={filters.method} onChange={(event) => updateFilter("method", event.target.value)}>
+                {methodOptions.map((method) => (
+                  <option key={method} value={method}>
+                    {method === "all" ? "全部" : method}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>状态码</span>
+              <input value={filters.statusCode} placeholder="403" onChange={(event) => updateFilter("statusCode", event.target.value.replace(/\D/g, "").slice(0, 3))} />
+            </label>
+          </div>
+
+          <FieldLabel label="Cloudflare action">
+            <select value={filters.action} onChange={(event) => updateFilter("action", event.target.value)}>
+              {actionOptions.map((action) => (
+                <option key={action} value={action}>
+                  {action === "all" ? "全部" : action}
+                </option>
+              ))}
+            </select>
+          </FieldLabel>
+        </div>
 
         <div className="rain-console-pills">
           <button type="button" onClick={applyFilters} data-active={isPending}>
-            {isPending ? "APPLYING" : "APPLY"}
+            {isPending ? "扫描中" : "执行扫描"}
           </button>
           <button type="button" onClick={clearFilters}>
-            RESET
+            清除锁定
           </button>
         </div>
       </aside>
 
-      <section className="rain-console-main" aria-label="事件列表">
+      <section className="rain-console-main rain-event-queue" aria-label="事件列表">
         <div className="rain-console-topline">
-          <span>STREAM / TIMESTAMP DESC</span>
-          <Link href="/security/situation">OPEN VISUAL</Link>
+          <span>EVENT QUEUE / TIME DESC</span>
+          <strong>{visibleEvents.length} ITEMS / {highCount} HIGH+</strong>
+          <Link href="/security/situation">打开态势图</Link>
         </div>
         <div className="rain-event-stream">
           {visibleEvents.map((event, index) => (
             <button
-              key={event.id}
+              key={`${event.id}:event:${index}`}
               type="button"
               className="rain-event-row"
               data-risk={event.riskLevel}
@@ -557,67 +627,89 @@ function RainEventConsole({
               style={{ "--row-delay": `${index * 28}ms` } as React.CSSProperties}
               onClick={() => setSelectedId(event.id)}
             >
-              <span>{formatTime(event.timestamp)}</span>
-              <em>{eventKindText(event)}</em>
-              <strong>{event.clientIp}</strong>
-              <small title={compactEventLine(event)}>{compactEventLine(event)}</small>
-              <i title={`${event.action} / ${toolSummary(event)}`}>{toolSummary(event)}</i>
+              <span className="rain-event-time">
+                {formatTime(event.timestamp)}
+                <b>{event.source}</b>
+              </span>
+              <em className="rain-event-risk">{riskText[event.riskLevel]}</em>
+              <strong className="rain-event-source">{event.clientIp}</strong>
+              <small className="rain-event-action" title={`${event.action} / ${event.method} / ${event.statusCode}`}>
+                <span>{event.action}</span>
+                <b>
+                  {event.method} / {event.statusCode}
+                </b>
+              </small>
+              <span className="rain-event-rule" title={ruleHitSummary(event)}>
+                {ruleHitSummary(event)}
+              </span>
+              <i title={`${compactEventLine(event)} / ${toolSummary(event)}`}>{toolSummary(event)}</i>
             </button>
           ))}
-          {visibleEvents.length === 0 && <div className="rain-console-empty">NO MATCHED EVENT</div>}
+          {visibleEvents.length === 0 && <div className="rain-console-empty">没有匹配事件</div>}
         </div>
       </section>
 
-      <aside className="rain-console-detail" aria-label="事件详情">
+      <aside className="rain-console-detail rain-evidence-lock" data-risk={selectedEvent?.riskLevel ?? "info"} aria-label="事件详情">
         {selectedEvent ? (
-          <>
-            <div className="rain-detail-heading">
-              <span>FORENSIC DETAIL</span>
+          <div key={selectedEvent.id} className="rain-evidence-window">
+            <div className="rain-detail-lockbar">
+              <span>LOCKED EVENT</span>
+              <strong>{selectedEvent.id}</strong>
+            </div>
+            <div className="rain-detail-heading rain-detail-phase-title">
+              <span>FORENSIC WINDOW</span>
               <strong>{eventKindText(selectedEvent)} / {eventDisplayCategory(selectedEvent)}</strong>
-              <Link href={`/security/events/${encodeURIComponent(selectedEvent.id)}`}>PERMALINK</Link>
+              <div className="rain-detail-actions">
+                <Link href={`/security/events/${encodeURIComponent(selectedEvent.id)}`}>查看固定链接</Link>
+                <Link href="/security/situation">打开态势图</Link>
+              </div>
             </div>
-            <div className="rain-detail-summary">{selectedEvent.summary}</div>
+            <div className="rain-detail-summary rain-detail-phase-summary">{selectedEvent.summary}</div>
             <div className="rain-detail-grid">
-              <HudMetric label="SOURCE" value={selectedEvent.clientIp} />
-              <HudMetric label="AREA" value={`${selectedEvent.country} / ${selectedEvent.city || selectedEvent.region || "N/A"}`} />
-              <HudMetric label={eventTrafficKind(selectedEvent) === "visit" ? "VISIT" : "ATTACK"} value={eventDisplayCategory(selectedEvent)} />
-              <HudMetric label="SUBTYPE" value={selectedEvent.attackSubtype || selectedEvent.eventType} />
-              <HudMetric label="METHOD" value={selectedEvent.method} />
-              <HudMetric label="STATUS" value={String(selectedEvent.statusCode)} />
-              <HudMetric label="ACTION" value={selectedEvent.action} />
-              <HudMetric label="RISK" value={riskText[selectedEvent.riskLevel]} />
-              <HudMetric label="RAY" value={selectedEvent.rayId || "N/A"} />
-              <HudMetric label="CONF" value={`${Math.round(selectedEvent.confidence * 100)}%`} />
-              <HudMetric label="RULES" value={String(selectedRuleHits.length)} />
-              <HudMetric label="VERSION" value={selectedEvent.ruleVersion || "N/A"} />
+              <HudMetric label="源 IP" value={selectedEvent.clientIp} />
+              <HudMetric label="区域" value={localizedPlaceName(selectedEvent.country, selectedEvent.city || selectedEvent.region)} />
+              <HudMetric label="流量类型" value={eventKindText(selectedEvent)} />
+              <HudMetric label="事件类型" value={eventDisplayCategory(selectedEvent)} />
+              <HudMetric label="子类型" value={selectedEvent.attackSubtype || selectedEvent.eventType} />
+              <HudMetric label="HTTP 方法" value={selectedEvent.method} />
+              <HudMetric label="状态码" value={String(selectedEvent.statusCode)} />
+              <HudMetric label="Cloudflare action" value={selectedEvent.action} />
+              <HudMetric label="风险" value={riskText[selectedEvent.riskLevel]} />
+              <HudMetric label="ray id" value={selectedEvent.rayId || "N/A"} />
+              <HudMetric label="置信度" value={`${Math.round(selectedEvent.confidence * 100)}%`} />
+              <HudMetric label="规则数" value={String(selectedRuleHits.length)} />
+              <HudMetric label="版本" value={selectedEvent.ruleVersion || "N/A"} />
             </div>
-            <div className="rain-template-block">
-              <span>TOOL SIGNATURE</span>
-              <p>{selectedEvent.toolSignature || selectedEvent.userAgent || "N/A"}</p>
-              <p>{selectedEvent.behaviorFingerprint || "No behavior fingerprint in current event payload."}</p>
-              <p>Campaign: {selectedEvent.campaignId || "N/A"}</p>
+            <div className="rain-template-block rain-evidence-section">
+              <span>EVIDENCE / REQUEST TRACE</span>
+              {eventEvidenceItems(selectedEvent).map((item, index) => (
+                <p key={`${selectedEvent.id}:evidence:${index}`}>{item}</p>
+              ))}
+              <p>tool={selectedEvent.toolSignature || selectedEvent.userAgent || "N/A"}</p>
+              <p>fingerprint={selectedEvent.behaviorFingerprint || "当前事件 payload 未提供 behaviorFingerprint。"}</p>
+              <p>campaignId={selectedEvent.campaignId || "N/A"}</p>
             </div>
             <div className="rain-rule-list">
-              <span>RULE HITS</span>
-              {selectedRuleHits.map((rule) => (
-                <small key={`${rule.id}:${rule.mode}:${rule.classification}`}>
-                  {rule.matched ? "MATCHED" : "SHADOW"} / {rule.id} / {rule.name} / {rule.mode} / {rule.severity} / {rule.classification} /{" "}
-                  {Math.round(rule.confidence * 100)}%
+              <span>RULE HIT / READBACK</span>
+              {selectedRuleHits.map((rule, index) => (
+                <small key={`${rule.id}:${rule.mode}:${rule.classification}:${index}`} data-risk={rule.severity}>
+                  <b>{rule.matched ? "MATCH" : "SHADOW"}</b> / {rule.id} / {rule.name}
+                  <br />
+                  {rule.mode} / {rule.severity} / {rule.classification} / {Math.round(rule.confidence * 100)}%
                   {Array.isArray(rule.evidence) && rule.evidence.length > 0 ? ` / evidence: ${rule.evidence.join(" | ")}` : ""}
                 </small>
               ))}
-              {selectedRuleHits.length === 0 && <small>Cloudflare did not return matched rule details.</small>}
+              {selectedRuleHits.length === 0 && <small>Cloudflare 未返回命中规则详情。</small>}
               {selectedPrimaryRule && <small>PRIMARY / {selectedPrimaryRule.id} / {selectedPrimaryRule.name}</small>}
             </div>
-            <div className="rain-template-block">
-              <span>AI ANALYSIS / RESERVED</span>
-              <p>大模型分析暂缓接入；当前只展示规则分析、Cloudflare action 和原始证据。</p>
-            </div>
             <EventAlertText event={selectedEvent} />
-            <pre className="rain-raw-json">{JSON.stringify(selectedEvent.raw, null, 2)}</pre>
-          </>
+            <div className="rain-template-block rain-raw-json-block">
+              <span>RAW JSON / EVENT PAYLOAD</span>
+              <pre className="rain-raw-json">{JSON.stringify(selectedEvent.raw, null, 2)}</pre>
+            </div>
+          </div>
         ) : (
-          <div className="rain-console-empty">SELECT EVENT</div>
+          <div className="rain-console-empty">请选择事件</div>
         )}
       </aside>
     </div>
@@ -625,27 +717,39 @@ function RainEventConsole({
 }
 
 function permissionStatus(permissions: PermissionCheck[]) {
-  if (permissions.length === 0) return "WAIT";
-  if (permissions.every((permission) => permission.ok)) return "READY";
-  if (permissions.some((permission) => permission.ok)) return "PARTIAL";
-  return "FAILED";
+  if (permissions.length === 0) return "待校验";
+  if (permissions.every((permission) => permission.ok)) return "就绪";
+  if (permissions.some((permission) => permission.ok)) return "部分就绪";
+  return "失败";
 }
 
 function tokenFormatStatus(zoneId: string, token: string, hasToken: boolean) {
   const zoneOk = /^[A-Za-z0-9_-]{8,}$/.test(zoneId || "");
   const tokenOk = Boolean(token && token.length >= 10 && !/\s/.test(token));
-  if (!token && hasToken) return zoneOk ? "STORED" : "ZONE PENDING";
-  if (zoneOk && tokenOk) return "LOCAL OK";
-  if (!zoneId && !token && !hasToken) return "EMPTY";
-  return "LOCAL FAIL";
+  if (!token && hasToken) return zoneOk ? "已保存" : "待填写 Zone ID";
+  if (zoneOk && tokenOk) return "本地格式通过";
+  if (!zoneId && !token && !hasToken) return "未填写";
+  return "本地格式异常";
 }
 
 function realCheckStatus(mode: SecurityDataMode, cloudflareLive?: boolean) {
-  if (cloudflareLive || mode === "live") return "CLOUDFLARE LIVE";
-  if (mode === "stale") return "STALE DATA";
-  if (mode === "degraded") return "DEGRADED";
-  if (mode === "mock" || mode === "mock-cloudflare") return "LOCAL ONLY";
-  return "SAMPLE";
+  if (cloudflareLive || mode === "live") return "Cloudflare 已连通";
+  if (mode === "stale") return "使用旧数据";
+  if (mode === "degraded") return "降级";
+  if (mode === "mock" || mode === "mock-cloudflare") return "仅本地校验";
+  return "样例";
+}
+
+function syncStatusText(status?: string) {
+  if (!status) return "未同步";
+  if (status === "success") return "成功";
+  if (status === "failed") return "失败";
+  if (status === "partial") return "部分完成";
+  if (status === "stale") return "旧数据";
+  if (status === "degraded") return "降级";
+  if (status === "sample") return "样例";
+  if (status === "mock") return "模拟";
+  return status;
 }
 
 function RainSettingsConsole({
@@ -667,15 +771,24 @@ function RainSettingsConsole({
   const [retentionDays, setRetentionDays] = useState(settings.rawRetentionDays);
   const [permissions, setPermissions] = useState(settings.permissions);
   const [hasToken, setHasToken] = useState(settings.hasCloudflareToken);
-  const [message, setMessage] = useState(settings.lastTokenCheckAt ? `LAST CHECK ${settings.lastTokenCheckAt}` : "WAITING_FOR_TOKEN");
-  const [busy, setBusy] = useState<"save" | "check" | "sync" | null>(null);
+  const [message, setMessage] = useState(settings.lastTokenCheckAt ? `上次校验 ${settings.lastTokenCheckAt}` : "等待 Token");
+  const [busy, setBusy] = useState<"save" | "check" | "sync" | "workerSync" | null>(null);
 
   const sampleMode = !hasToken && !token;
   const readiness = permissionStatus(permissions);
-  const dataMode = resolveDataMode(source, error, syncStatus);
-  const dataModeInfo = modeCopy(dataMode, syncStatus);
+  const cloudflareSyncStatus: SyncStatus = { ...syncStatus, ...(syncStatus.cloudflare ?? {}) };
+  const workerLogSync = syncStatus.workerLog;
+  const dataMode = resolveDataMode(source, error, cloudflareSyncStatus);
+  const dataModeInfo = modeCopy(dataMode, cloudflareSyncStatus);
+  const workerModeInfo = workerLogSync
+    ? modeCopy(workerLogSync.mode ?? (workerLogSync.usedStaleData ? "stale" : workerLogSync.status === "failed" ? "degraded" : "live"), workerLogSync)
+    : {
+        label: "未同步",
+        detail: "尚未执行 Worker/D1 访问日志同步。本地运行测试时可从 D1 拉取最新访问记录。",
+        tone: "degraded" as const,
+      };
   const formatStatus = tokenFormatStatus(zoneId, token, hasToken);
-  const cloudflareStatus = realCheckStatus(dataMode, syncStatus.cloudflareLive);
+  const cloudflareStatus = realCheckStatus(dataMode, cloudflareSyncStatus.cloudflareLive);
 
   const saveSettings = async () => {
     setBusy("save");
@@ -691,7 +804,7 @@ function RainSettingsConsole({
       setHasToken(savedSettings.hasCloudflareToken);
       setPermissions(savedSettings.permissions ?? permissions);
     }
-    setMessage(result.error ?? `${result.data.mode.toUpperCase()} / ${result.data.message || "CONFIG SAVED"}`);
+    setMessage(result.error ?? `${modeCopy(result.data.mode).label} / ${result.data.message || "配置已保存"}`);
   };
 
   const checkToken = async () => {
@@ -700,151 +813,261 @@ function RainSettingsConsole({
     setBusy(null);
     const check = (result.data as TokenCheckApiResult).tokenCheck;
     if (check.permissions) setPermissions(check.permissions);
-    setMessage(result.error ?? result.data.message ?? check.errorMessage ?? `TOKEN CHECK ${check.status.toUpperCase()}`);
+    setMessage(result.error ?? result.data.message ?? check.errorMessage ?? `Token 校验${tokenCheckStatusText(check.status)}`);
   };
 
   const syncNow = async () => {
     setBusy("sync");
     const result = await runSecuritySync();
     setBusy(null);
-    setMessage(result.error ?? `${result.data.mode.toUpperCase()} / ${result.data.message}`);
+    const mode = result.data.mode === "worker_log" ? "live" : result.data.mode;
+    setMessage(result.error ?? `${modeCopy(mode).label} / ${result.data.message}`);
+  };
+
+  const syncWorkerLogs = async () => {
+    setBusy("workerSync");
+    const result = await runWorkerLogSync();
+    setBusy(null);
+    setMessage(result.error ?? `${syncStatusText(result.data.status)} / ${result.data.message}`);
   };
 
   const saveThreshold = async (level: RiskLevel) => {
     setThreshold(level);
     const result = await updateRiskThreshold(level);
-    setMessage(result.error ?? `RISK THRESHOLD ${result.data.highRiskThreshold.toUpperCase()}`);
+    setMessage(result.error ?? `风险阈值已更新为 ${riskText[result.data.highRiskThreshold]}`);
   };
 
   return (
     <div className="rain-console-grid rain-settings-console">
       <aside className="rain-console-spine" aria-label="配置状态">
-        <p>CONTROL SPINE</p>
-        <HudMetric label="HOST" value={monitoredHost} />
-        <HudMetric label="MODE" value={sampleMode ? "SAMPLE" : dataModeInfo.label} />
-        <HudMetric label="FORMAT" value={formatStatus} />
-        <HudMetric label="CHECK" value={cloudflareStatus} />
-        <HudMetric label="TOKEN" value={hasToken ? "CONFIGURED" : "EMPTY"} />
-        <HudMetric label="PERMISSION" value={readiness} />
-        <HudMetric label="SYNC" value={`${refreshHours}H`} />
-        <HudMetric label="RAW" value={`${retentionDays}D`} />
+        <p>控制状态</p>
+        <HudMetric label="监控 Host" value={monitoredHost} />
+        <HudMetric label="Cloudflare" value={sampleMode ? "样例" : dataModeInfo.label} />
+        <HudMetric label="Worker/D1" value={workerModeInfo.label} />
+        <HudMetric label="Token 格式" value={formatStatus} />
+        <HudMetric label="校验" value={cloudflareStatus} />
+        <HudMetric label="Token" value={hasToken ? "已配置" : "未填写"} />
+        <HudMetric label="权限" value={readiness} />
+        <HudMetric label="官方同步" value={`${refreshHours} 小时`} />
+        <HudMetric label="原始保留" value={`${retentionDays} 天`} />
         <div className="rain-mode-note" data-mode={dataModeInfo.tone}>
           <strong>{dataModeInfo.label}</strong>
           <span>{dataModeInfo.detail}</span>
         </div>
+        <div className="rain-mode-note" data-mode={workerModeInfo.tone}>
+          <strong>{workerModeInfo.label}</strong>
+          <span>{workerModeInfo.detail}</span>
+        </div>
       </aside>
 
-      <section className="rain-console-main" aria-label="Cloudflare 配置">
+      <section className="rain-console-main rain-settings-main" aria-label="安全设置分区">
         <div className="rain-console-topline">
-          <span>CLOUDFLARE / READ ONLY</span>
-          <button type="button" onClick={syncNow} disabled={busy !== null}>
-            {busy === "sync" ? "SYNCING" : "SYNC NOW"}
-          </button>
+          <span>CONFIG / OFFICIAL + D1 CHANNELS</span>
+          <strong>{sampleMode ? "样例模式" : `${readiness} / ${cloudflareStatus}`}</strong>
         </div>
 
-        <div className="rain-settings-fields">
-          <FieldLabel label="MONITORED HOST">
-            <input value={monitoredHost} onChange={(event) => setMonitoredHost(event.target.value)} />
-          </FieldLabel>
-          <FieldLabel label="CLOUDFLARE ZONE ID">
-            <input value={zoneId} placeholder="Zone ID" onChange={(event) => setZoneId(event.target.value)} />
-          </FieldLabel>
-          <FieldLabel label="API TOKEN">
-            <input
-              value={token}
-              type="password"
-              placeholder={hasToken ? "Token configured. Enter a new token to replace." : "Token is empty. Sample data is active."}
-              onChange={(event) => setToken(event.target.value)}
-            />
-          </FieldLabel>
-          <FieldLabel label="REFRESH WINDOW">
-            <input min={1} max={24} type="number" value={refreshHours} onChange={(event) => setRefreshHours(Number(event.target.value))} />
-          </FieldLabel>
-          <FieldLabel label="ALERT THRESHOLD">
-            <select value={threshold} onChange={(event) => saveThreshold(event.target.value as RiskLevel)}>
-              {(["info", "low", "medium", "high", "critical"] as RiskLevel[]).map((level) => (
-                <option key={level} value={level}>
-                  {riskText[level]}
-                </option>
+        <div className="rain-settings-section-grid">
+          <section className="rain-settings-section" aria-label="Cloudflare 官方 API">
+            <div className="rain-settings-section-head">
+              <span>01 / CLOUDFLARE API</span>
+              <h2>Cloudflare 官方 API</h2>
+              <p>配置只读接入信息，并通过 Token 校验确认权限状态。</p>
+            </div>
+
+            <div className="rain-settings-fields">
+              <FieldLabel label="监控 Host">
+                <input value={monitoredHost} onChange={(event) => setMonitoredHost(event.target.value)} />
+              </FieldLabel>
+              <FieldLabel label="Cloudflare Zone ID">
+                <input value={zoneId} placeholder="Zone ID" onChange={(event) => setZoneId(event.target.value)} />
+              </FieldLabel>
+              <FieldLabel label="API Token">
+                <input
+                  value={token}
+                  type="password"
+                  placeholder={hasToken ? "Token 已配置，输入新 Token 后替换。" : "Token 未填写，当前使用样例数据。"}
+                  onChange={(event) => setToken(event.target.value)}
+                />
+              </FieldLabel>
+              <div className="rain-console-field">
+                <span>Token 就绪状态</span>
+                <strong>{sampleMode ? "样例模式" : `${readiness} / ${cloudflareStatus}`}</strong>
+              </div>
+              <div className="rain-console-field rain-console-field-wide">
+                <span>Token 存储说明</span>
+                <strong>{hasToken ? "已保存的 Token 不会回显；只在输入新 Token 后替换。" : "保存 Token 后页面只显示已配置状态。"}</strong>
+              </div>
+            </div>
+
+            <div className="rain-console-pills">
+              <button type="button" onClick={saveSettings} disabled={busy !== null}>
+                {busy === "save" ? "保存中" : "保存配置"}
+              </button>
+              <button type="button" onClick={checkToken} disabled={busy !== null}>
+                {busy === "check" ? "校验中" : "校验 Token"}
+              </button>
+            </div>
+          </section>
+
+          <section className="rain-settings-section" aria-label="Worker/D1 日志链路">
+            <div className="rain-settings-section-head">
+              <span>02 / WORKER D1 LOGS</span>
+              <h2>Worker/D1 日志链路</h2>
+              <p>从 Worker 采集服务导出 D1 访问日志，并写入本地 SQLite；这不使用 Cloudflare 官方 API Token。</p>
+            </div>
+
+            <div className="rain-detail-grid">
+              <HudMetric label="本地事件" value={String(syncStatus.localEventCount)} />
+              <HudMetric label="聚合统计" value={String(syncStatus.aggregateCount)} />
+              <HudMetric label="日志状态" value={syncStatusText(workerLogSync?.status)} />
+              <HudMetric label="最近成功" value={workerLogSync?.lastSuccessAt || "未同步"} />
+            </div>
+
+            <div className="rain-console-pills rain-console-pills-single">
+              <button type="button" onClick={syncWorkerLogs} disabled={busy !== null}>
+                {busy === "workerSync" ? "拉取中" : "同步访问日志"}
+              </button>
+            </div>
+
+            <div className="rain-mode-note" data-mode={workerModeInfo.tone}>
+              <strong>{workerModeInfo.label}</strong>
+              <span>{workerModeInfo.detail}</span>
+            </div>
+
+            <div className="rain-rule-list">
+              <span>Cloudflare 官方权限项</span>
+              {permissions.map((permission, index) => (
+                <small key={`${permission.name}:permission:${index}`} data-ok={permission.ok}>
+                  {permission.name} / {permission.ok ? "通过" : "待处理"} / {permission.detail}
+                </small>
               ))}
-            </select>
-          </FieldLabel>
-          <FieldLabel label="RAW RETENTION">
-            <input min={7} max={365} type="number" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} />
-          </FieldLabel>
-          <div className="rain-console-field">
-            <span>AGGREGATE</span>
-            <strong>{settings.aggregateRetention}</strong>
-          </div>
+            </div>
+          </section>
+
+          <section className="rain-settings-section" aria-label="同步状态">
+            <div className="rain-settings-section-head">
+              <span>03 / SYNC STATE</span>
+              <h2>Cloudflare 官方同步</h2>
+              <p>控制 Cloudflare GraphQL 同步间隔，并查看官方统计与安全事件的最近同步状态。</p>
+            </div>
+
+            <div className="rain-settings-fields rain-settings-fields-compact">
+              <FieldLabel label="同步间隔（小时）">
+                <input min={1} max={24} type="number" value={refreshHours} onChange={(event) => setRefreshHours(Number(event.target.value))} />
+              </FieldLabel>
+              <div className="rain-console-field">
+                <span>当前状态</span>
+                <strong>{syncStatusText(cloudflareSyncStatus.status)}</strong>
+              </div>
+              <div className="rain-console-field">
+                <span>最近同步</span>
+                <strong>{cloudflareSyncStatus.lastSyncAt || "N/A"}</strong>
+              </div>
+              <div className="rain-console-field">
+                <span>最近成功</span>
+                <strong>{cloudflareSyncStatus.lastSuccessAt || "N/A"}</strong>
+              </div>
+            </div>
+
+            <div className="rain-console-pills rain-console-pills-single">
+              <button type="button" onClick={syncNow} disabled={busy !== null}>
+                {busy === "sync" ? "同步中" : "同步 Cloudflare"}
+              </button>
+            </div>
+
+            <div className="rain-mode-note" data-mode={dataModeInfo.tone}>
+              <strong>{dataModeInfo.label}</strong>
+              <span>{dataModeInfo.detail}</span>
+            </div>
+          </section>
+
+          <section className="rain-settings-section" aria-label="数据保留">
+            <div className="rain-settings-section-head">
+              <span>04 / RETENTION</span>
+              <h2>数据保留</h2>
+              <p>管理原始事件保留天数、聚合保留策略和提醒阈值。</p>
+            </div>
+
+            <div className="rain-settings-fields">
+              <FieldLabel label="原始事件保留（天）">
+                <input min={7} max={365} type="number" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} />
+              </FieldLabel>
+              <FieldLabel label="提醒阈值">
+                <select value={threshold} onChange={(event) => saveThreshold(event.target.value as RiskLevel)}>
+                  {(["info", "low", "medium", "high", "critical"] as RiskLevel[]).map((level) => (
+                    <option key={level} value={level}>
+                      {riskText[level]}
+                    </option>
+                  ))}
+                </select>
+              </FieldLabel>
+              <div className="rain-console-field">
+                <span>聚合保留</span>
+                <strong>{settings.aggregateRetention}</strong>
+              </div>
+              <div className="rain-console-field">
+                <span>旧数据</span>
+                <strong>{cloudflareSyncStatus.usedStaleData || workerLogSync?.usedStaleData ? "使用中" : "未使用"}</strong>
+              </div>
+            </div>
+
+            <div className="rain-template-block">
+              <span>边界</span>
+              <p>Cloudflare 官方 API 与 Worker/D1 访问日志是两条独立链路；访问日志同步失败不会清空已保存的 Zone ID 或 API Token。</p>
+              <p>原始事件默认保留 {retentionDays} 天；聚合统计长期保留。</p>
+            </div>
+          </section>
         </div>
 
-        <div className="rain-console-pills">
-          <button type="button" onClick={saveSettings} disabled={busy !== null}>
-            {busy === "save" ? "SAVING" : "SAVE CONFIG"}
-          </button>
-          <button type="button" onClick={checkToken} disabled={busy !== null}>
-            {busy === "check" ? "CHECKING" : "CHECK TOKEN"}
-          </button>
-        </div>
-
-        <div className="rain-template-block" aria-live="polite">
-          <span>OPERATION RESULT</span>
+        <div className="rain-template-block rain-settings-result" aria-live="polite">
+          <span>操作结果</span>
           <p>{message}</p>
-          <p>Token 格式: {formatStatus} / 真实校验: {cloudflareStatus}</p>
+          <p>Cloudflare API: {formatStatus} / {cloudflareStatus}；Worker/D1: {syncStatusText(workerLogSync?.status)}</p>
         </div>
       </section>
-
-      <aside className="rain-console-detail" aria-label="权限与边界">
-        <div className="rain-detail-heading">
-          <span>TOKEN READINESS</span>
-          <strong>{sampleMode ? "SAMPLE MODE" : `${readiness} / ${cloudflareStatus}`}</strong>
-        </div>
-        <div className="rain-detail-summary">
-          {sampleMode
-            ? "未配置 Cloudflare Token 时自动启用样例数据。Token 无效、权限不足或同步失败时，页面会展示 degraded 或 stale 状态。"
-            : "Token 已配置；页面只显示配置状态，不回显 Token 明文。真实 Cloudflare 状态以 CHECK 和 MODE 为准。"}
-        </div>
-        <div className="rain-rule-list">
-          <span>PERMISSIONS</span>
-          {permissions.map((permission) => (
-            <small key={permission.name} data-ok={permission.ok}>
-              {permission.name} / {permission.ok ? "OK" : "WAIT"} / {permission.detail}
-            </small>
-          ))}
-        </div>
-        <div className="rain-template-block">
-          <span>BOUNDARY</span>
-          <p>一期只读取 Cloudflare 数据，不主动修改 WAF、防火墙或访问规则。</p>
-          <p>原始事件默认保留 {retentionDays} 天；聚合统计长期保留。</p>
-        </div>
-      </aside>
     </div>
   );
 }
 
 export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
+  const router = useRouter();
   const { cursorRef } = useRainCursor();
   const isEvents = props.page === "events";
+  const isSettings = props.page === "settings";
   const pageMeta = isEvents ? pageCopy.events : pageCopy.settings;
   const dataMode = resolveDataMode(props.source, props.error, props.syncStatus);
   const dataModeInfo = modeCopy(dataMode, props.syncStatus);
+  const rootClassName = isEvents ? "rain-home rain-subpage rain-subpage-plain rain-events-page" : "rain-home rain-subpage rain-subpage-plain";
+  const layerClassName = isEvents
+    ? "rain-content-layer rain-content-layer-mvp rain-content-layer-rain rain-events-layer"
+    : "rain-content-layer rain-content-layer-mvp rain-content-layer-rain rain-settings-layer";
+  const workspaceClassName = isEvents ? "rain-mvp-workspace rain-mvp-workspace-rain rain-event-workspace" : "rain-mvp-workspace rain-mvp-workspace-rain rain-settings-workspace";
 
   const stats: Array<[string, string]> = isEvents
     ? [
-        ["EVENTS", props.events.length.toString()],
-        ["HIGH+", props.events.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length.toString()],
-        ["AREAS", new Set(props.events.map((event) => event.country).filter(Boolean)).size.toString()],
-        ["MODE", dataModeInfo.label],
+        ["事件", props.events.length.toString()],
+        ["高危+", props.events.filter((event) => riskRank[event.riskLevel] >= riskRank.high).length.toString()],
+        ["区域", new Set(props.events.map((event) => event.country).filter(Boolean)).size.toString()],
+        ["模式", dataModeInfo.label],
       ]
     : [
-        ["ZONE", props.settings.zoneId ? "READY" : "PENDING"],
-        ["TOKEN", props.settings.hasCloudflareToken ? "READY" : "EMPTY"],
-        ["SYNC", props.settings.sampleMode ? "SAMPLE" : dataModeInfo.label],
-        ["RISK", riskText[props.settings.highRiskThreshold]],
+        ["Zone ID", props.settings.zoneId ? "就绪" : "待填写"],
+        ["Token", props.settings.hasCloudflareToken ? "就绪" : "未填写"],
+        ["同步", props.settings.sampleMode ? "样例" : dataModeInfo.label],
+        ["风险", riskText[props.settings.highRiskThreshold]],
       ];
 
+  const returnToPreviousPage = () => {
+    if (window.history.length > 1) {
+      router.back();
+      return;
+    }
+
+    router.push("/security");
+  };
+
   return (
-    <main className="rain-home rain-subpage rain-subpage-plain">
+    <main className={rootClassName}>
       <div ref={cursorRef} className="rain-cursor" aria-hidden="true">
         <span className="rain-cursor-x" />
         <span className="rain-cursor-y" />
@@ -854,9 +1077,15 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
       <div className="rain-left-dot" aria-hidden="true" />
       <div className="rain-grid" aria-hidden="true" />
       <div className="rain-glow" aria-hidden="true" />
-      <SecurityGlobalNav active={pageMeta.active} />
+      {isEvents ? <SecurityGlobalNav active="events" /> : null}
+      {isSettings ? (
+        <button type="button" className="security-settings-back" onClick={returnToPreviousPage}>
+          <span>BACK</span>
+          <strong>返回上一页</strong>
+        </button>
+      ) : null}
 
-      <section className="rain-content-layer rain-content-layer-mvp rain-content-layer-rain" aria-label={pageMeta.title}>
+      <section className={layerClassName} aria-label={pageMeta.title}>
         <div className="rain-content-index" aria-hidden="true">
           {pageMeta.index}
         </div>
@@ -867,15 +1096,15 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
         </div>
 
         <div className="rain-content-metrics">
-          {stats.map(([label, value]) => (
-            <div key={label}>
+          {stats.map(([label, value], index) => (
+            <div key={`${label}:stat:${index}`}>
               <span>{label}</span>
               <strong>{value}</strong>
             </div>
           ))}
         </div>
 
-        <div className="rain-mvp-workspace rain-mvp-workspace-rain">
+        <div className={workspaceClassName}>
           {isEvents ? (
             <RainEventConsole
               key={JSON.stringify(props.initialFilters ?? {})}
@@ -892,8 +1121,8 @@ export function RainSecuritySubPage(props: RainSecuritySubPageProps) {
       </section>
 
       <div className="rain-mobile-title">
-        <p>{isEvents ? "EVENT STREAM" : "CONTROL ROOM"}</p>
-        <h1>{isEvents ? "EVENTS" : "CONFIG"}</h1>
+        <p>{isEvents ? "事件流" : "控制室"}</p>
+        <h1>{isEvents ? "事件" : "配置"}</h1>
       </div>
     </main>
   );

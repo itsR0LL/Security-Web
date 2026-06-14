@@ -10,6 +10,7 @@ __pycache__/
 venv/
 .agents/
 .playwright-mcp/
+.codex-runtime/
 skills-lock.json
 security_data/
 *.sqlite
@@ -22,3 +23,5 @@ security-*.png
 homepage-*.png
 rainmorime-*.png
 .tmp-*
+start_all.bat
+stop_all.bat

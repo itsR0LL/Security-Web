@@ -1,3 +1,5 @@
+import { formatCountryDisplayName } from "./security-locale";
+
 export type RiskLevel = "info" | "low" | "medium" | "high" | "critical";
 
 export type SyncStatusValue = "success" | "failed" | "partial" | "sample" | "degraded" | "stale";
@@ -133,6 +135,8 @@ export type PermissionCheck = {
   detail: string;
 };
 
+export type SyncRunSource = "cloudflare" | "worker_log";
+
 export type SyncStatus = {
   status: SyncStatusValue;
   mode?: SecurityDataMode;
@@ -145,6 +149,22 @@ export type SyncStatus = {
   aggregateCount: number;
   refreshIntervalHours: number;
   permissions: PermissionCheck[];
+  cloudflare?: SyncSourceStatus;
+  workerLog?: SyncSourceStatus;
+};
+
+export type SyncSourceStatus = {
+  syncType: SyncRunSource;
+  source: SyncRunSource;
+  status: SyncStatusValue;
+  mode?: SecurityDataMode;
+  cloudflareLive?: boolean;
+  lastSyncAt: string;
+  lastSuccessAt: string;
+  usedStaleData: boolean;
+  apiError: string | null;
+  eventCount: number;
+  aggregateCount: number;
 };
 
 export type SecurityOverview = {
@@ -977,7 +997,7 @@ export function createSampleSecurityData(now = new Date()): SecuritySampleData {
     ],
     globePoints: events.map((event, index) => ({
       id: event.id,
-      label: `${event.city} ${event.eventType}`,
+      label: [formatCountryDisplayName(event.country), event.city, event.eventType].filter(Boolean).join(" "),
       clientIp: event.clientIp,
       country: event.country,
       city: event.city,
@@ -1095,6 +1115,13 @@ function countItems(values: Array<string | number | undefined | null>, limit = 8
     .slice(0, limit);
 }
 
+function displayCountryCountItems(values: Array<string | undefined | null>, limit = 8): AnalysisCountItem[] {
+  return countItems(values, limit).map((item) => ({
+    ...item,
+    label: formatCountryDisplayName(item.label),
+  }));
+}
+
 function eventEvidence(event: SecurityEvent): AnalysisEventEvidence {
   return {
     id: event.id,
@@ -1146,7 +1173,7 @@ function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: 
   const rules = [
     {
       id: "builtin-sensitive-path",
-      name: "Sensitive path probe",
+      name: "敏感路径探测",
       ruleType: "path_keyword",
       condition: {
         keywords: [
@@ -1175,7 +1202,7 @@ function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: 
     },
     {
       id: "builtin-sqli",
-      name: "SQL injection probe",
+      name: "SQL 注入探测",
       ruleType: "query_keyword",
       condition: { keywords: [" OR 1=1", "UNION SELECT", "--"] },
       severity: "high",
@@ -1188,7 +1215,7 @@ function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: 
     },
     {
       id: "builtin-xss",
-      name: "XSS probe",
+      name: "XSS 探测",
       ruleType: "query_keyword",
       condition: { keywords: ["<script", "javascript:", "onerror="] },
       severity: "medium",
@@ -1201,7 +1228,7 @@ function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: 
     },
     {
       id: "builtin-scanner-ua",
-      name: "Scanner User-Agent",
+      name: "扫描器 User-Agent",
       ruleType: "user_agent_keyword",
       condition: { keywords: ["curl", "zgrab", "python-requests", "Go-http-client"] },
       severity: "medium",
@@ -1214,7 +1241,7 @@ function baseRuleDefinitions(): Record<string, AnalysisRuleDefinition & { name: 
     },
     {
       id: "builtin-cloudflare-action",
-      name: "Cloudflare security action",
+      name: "Cloudflare 安全处置",
       ruleType: "cloudflare_action",
       condition: { actions: ["block", "challenge", "managed_challenge"] },
       severity: "high",
@@ -1300,7 +1327,7 @@ export function createAnalysisClusters(events: SecurityEvent[] = createSampleSec
           : null,
         primaryAction: action ? { action: action.label, count: action.value } : null,
         primaryUserAgent: userAgent ? { userAgent: userAgent.label, count: userAgent.value } : null,
-        countries: countItems(group.map((event) => event.country)),
+        countries: displayCountryCountItems(group.map((event) => event.country)),
         paths: countItems(group.map((event) => event.path)),
         methods: countItems(group.map((event) => event.method)),
         statusCodes: countItems(group.map((event) => event.statusCode)),
@@ -1459,10 +1486,10 @@ export function createAnalysisAdvice(clusters: AnalysisClustersResult = createAn
       id: `draft-${cluster.clusterId}`,
       status: "draft",
       sourceClusterId: cluster.clusterId,
-      title: `Review rule for ${cluster.attackCategory}`,
+      title: `复核规则：${cluster.attackCategory}`,
       riskLevel: cluster.riskLevel,
       confidence: cluster.confidence,
-      rationale: `${cluster.eventCount} events share rule, action, source, path, or tool evidence.`,
+      rationale: `${cluster.eventCount} 条事件共享相同规则、处置动作、来源、路径或工具证据。`,
       impact: {
         eventCount: cluster.eventCount,
         sourceCount: cluster.countries.length,
@@ -1495,16 +1522,16 @@ export function createAnalysisAdvice(clusters: AnalysisClustersResult = createAn
       },
       evidence: cluster.evidence,
       manualReviewQuestions: [
-        "Confirm whether the primary path is expected production traffic.",
-        "Confirm whether the source countries and user agents match known legitimate clients.",
-        "Confirm the rule mode before enabling enforcement.",
+        "确认主要路径是否属于预期的生产访问。",
+        "确认来源国家和 User-Agent 是否匹配已知的合法客户端。",
+        "在启用拦截前确认规则模式。",
       ],
     };
   });
 
   return {
     status: "draft",
-    message: "Rule advice is generated from aggregate data only. No large model was called.",
+    message: "规则建议仅由聚合数据生成，当前未调用大模型。",
     generatedAt: new Date().toISOString(),
     filters: defaultAnalysisFilters(),
     totalDrafts: items.length,

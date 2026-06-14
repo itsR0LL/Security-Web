@@ -3,6 +3,7 @@
 import type { CSSProperties } from "react";
 import type { GlobeRouteHover } from "@/components/security/ParticleGlobe";
 import { resolveTrafficKind } from "@/lib/security-data";
+import { formatCountryDisplayName } from "@/lib/security-locale";
 
 type RouteHoverLayout = "home" | "situation";
 
@@ -17,6 +18,18 @@ const EDGE_GUTTER = 18;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function localizedCountryName(value?: string) {
+  return formatCountryDisplayName(value) || "N/A";
+}
+
+function localizedPlaceName(country?: string, locality?: string) {
+  const displayLocality = locality?.trim();
+  if (!country?.trim()) return displayLocality || "";
+  const displayCountry = localizedCountryName(country);
+  if (!displayLocality) return displayCountry;
+  return `${displayCountry} / ${displayLocality}`;
 }
 
 function clampCss(min: number, preferred: number, max: number) {
@@ -86,7 +99,7 @@ export function RouteHoverPopover({ hover, layout = "home" }: RouteHoverPopoverP
   const hoverThroughput = hover.point.throughputMb
     ? `${hover.point.throughputMb.toFixed(1)} MB`
     : `${Math.max(1, Math.round(hover.point.count * 0.42))} MB`;
-  const hoverRouteLabel = `${hover.point.city || hover.point.country || hover.point.clientIp} -> Chengdu`;
+  const hoverRouteLabel = `${localizedPlaceName(hover.point.country, hover.point.city) || hover.point.clientIp} -> 成都`;
   const trafficKind = resolveTrafficKind(hover.point);
   const isVisit = trafficKind === "visit";
 
@@ -100,20 +113,20 @@ export function RouteHoverPopover({ hover, layout = "home" }: RouteHoverPopoverP
     >
       <div className="rain-route-popover-inner">
         <span className="rain-route-kicker">
-          {isVisit ? "VISIT TRACE" : hover.kind === "flight" ? "ROUTE TRACE" : "SOURCE TRACE"}
+          {isVisit ? "访问轨迹" : hover.kind === "flight" ? "飞线路径" : "来源定位"}
         </span>
         <strong>{hoverRouteLabel}</strong>
         <div className="rain-route-meta">
-          <span>TYPE</span>
-          <b>{isVisit ? "VISIT" : "ATTACK"}</b>
-          <span>ACTION</span>
+          <span>类型</span>
+          <b>{isVisit ? "访问" : "攻击"}</b>
+          <span>动作</span>
           <b>{hover.point.action?.toUpperCase() ?? (isVisit ? "ALLOW" : "LOG")}</b>
-          <span>{isVisit ? "COUNT" : "REQ"}</span>
+          <span>{isVisit ? "次数" : "请求"}</span>
           <b>{isVisit ? hover.point.count : `${hover.point.method ?? "GET"} / ${hover.point.statusCode ?? "-"}`}</b>
-          <span>FLOW</span>
+          <span>吞吐</span>
           <b>{hoverThroughput}</b>
         </div>
-        <p>{isVisit ? `${hover.point.country} request distribution` : hover.point.path ?? hover.point.eventType}</p>
+        <p>{isVisit ? `${localizedCountryName(hover.point.country)} 请求分布` : hover.point.path ?? hover.point.eventType}</p>
       </div>
     </div>
   );

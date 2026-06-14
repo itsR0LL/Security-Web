@@ -16,12 +16,12 @@ type RainSecurityHomeProps = {
 };
 
 const syncStatusLabel: Record<SyncStatusValue, string> = {
-  success: "LIVE",
-  failed: "DEGRADED",
-  partial: "PARTIAL",
-  sample: "SAMPLE",
-  degraded: "DEGRADED",
-  stale: "STALE",
+  success: "接口回放",
+  failed: "降级",
+  partial: "部分同步",
+  sample: "样例仿真",
+  degraded: "降级",
+  stale: "保留数据",
 };
 
 const railNavItems = [
@@ -31,7 +31,7 @@ const railNavItems = [
     cn: "态势",
     effect: "trace",
     code: "TRACE-021",
-    desc: "3D / 2D security situation",
+    desc: "3D / 2D 安全态势",
     meta: "globe attack flow",
     hud: ["GLOBE READY", "ATTACK FLOW", "SOURCE POINT", "TARGET CHENGDU", "2D MAP", "OPEN VISUAL"],
   },
@@ -41,55 +41,52 @@ const railNavItems = [
     cn: "事件",
     effect: "scan",
     code: "EVENT-064",
-    desc: "filter, inspect and copy alert text",
+    desc: "检索、检查并复制告警文本",
     meta: "latest event stream",
-    hud: ["FILTER READY", "TIME RANGE", "RISK LEVEL", "EVENT DETAIL", "RAW JSON", "ALERT TEXT"],
+    hud: ["FILTER READY", "TIME RANGE", "RISK LEVEL", "EVENT DETAIL", "RAW JSON", "MESSAGE TEXT"],
   },
   {
-    href: "/security/map",
-    label: "MAP",
-    cn: "地图",
+    href: "/security/analysis",
+    label: "ANALYSIS",
+    cn: "分析",
     effect: "radar",
-    code: "GEO-031",
-    desc: "request distribution by region",
-    meta: "source position layer",
-    hud: ["COUNTRY", "REGION", "CITY FALLBACK", "REQUEST FLOW", "DISTRIBUTION", "OPEN MAP"],
+    code: "ANALYZE-031",
+    desc: "攻击聚合、来源习惯与规则建议",
+    meta: "attack intelligence layer",
+    hud: ["CLUSTER", "SOURCE HABIT", "RULE TREND", "EVIDENCE", "DRAFT RULE", "OPEN ANALYSIS"],
   },
   {
-    href: "/security/settings",
-    label: "CONFIG",
-    cn: "设置",
+    label: "PASS",
+    cn: "预留",
     effect: "tower",
-    code: "ZONE-018",
-    desc: "Cloudflare token and sync policy",
-    meta: "local security config",
-    hud: ["ZONE ID", "TOKEN CHECK", "SYNC CYCLE", "RISK LEVEL", "RETENTION", "SAVE CONFIG"],
+    code: "PASS-04",
+    desc: "后续功能预留",
+    meta: "reserved extension slot",
+    hud: ["RESERVED", "NO ROUTE", "WAITING", "FUTURE MODULE", "KEEP SLOT", "PASS"],
   },
   {
-    href: "/security/events?risk=high",
-    label: "ALERT",
-    cn: "告警",
+    label: "PASS",
+    cn: "预留",
     effect: "ecg",
-    code: "RISK-009",
-    desc: "high risk events ready to notify",
-    meta: "manual message draft",
-    hud: ["HIGH", "CRITICAL", "ACTION", "SOURCE IP", "MESSAGE", "COPY TEXT"],
+    code: "PASS-05",
+    desc: "后续功能预留",
+    meta: "reserved extension slot",
+    hud: ["RESERVED", "NO ROUTE", "WAITING", "FUTURE MODULE", "KEEP SLOT", "PASS"],
   },
   {
-    href: "/security",
-    label: "STATUS",
-    cn: "状态",
+    label: "PASS",
+    cn: "预留",
     effect: "focus",
-    code: "SYNC-006",
-    desc: "data source, freshness and fallback",
-    meta: "overview status",
-    hud: ["LIVE/SAMPLE", "UPDATED", "FALLBACK", "HOST", "REQUESTS", "OVERVIEW"],
+    code: "PASS-06",
+    desc: "后续功能预留",
+    meta: "reserved extension slot",
+    hud: ["RESERVED", "NO ROUTE", "WAITING", "FUTURE MODULE", "KEEP SLOT", "PASS"],
   },
 ];
 
 function formatTime(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "PENDING";
+  if (Number.isNaN(date.getTime())) return "等待同步";
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
@@ -104,7 +101,7 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
   const [routeHover, setRouteHover] = useState<GlobeRouteHover | null>(null);
   const latestTraffic = overview.trafficTrend.at(-1);
   const highEvents = overview.recentEvents.filter((event) => event.riskLevel === "high" || event.riskLevel === "critical");
-  const modeLabel = error ? "FALLBACK" : source === "api" ? syncStatusLabel[overview.sync.status] : "SAMPLE";
+  const modeLabel = error ? "降级展示" : source === "api" ? syncStatusLabel[overview.sync.status] : "样例仿真";
   const totalBandwidth = useMemo(
     () => overview.trafficTrend.reduce((total, point) => total + point.bandwidthMb, 0),
     [overview.trafficTrend],
@@ -134,19 +131,14 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
         <strong>{overview.monitoredHost}</strong>
       </div>
       <div className="rain-home-corner rain-home-corner-right">
-        <span>UPDATED {formatTime(overview.generatedAt)}</span>
+        <span>生成时间 {formatTime(overview.generatedAt)}</span>
         <strong>{modeLabel}</strong>
       </div>
 
       <nav className="rain-right-panel rain-home-rail-nav" aria-label="安全平台首页导航">
-        {railNavItems.map((item, index) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            className={`rain-column rain-column-${index}`}
-            data-effect={item.effect}
-            aria-label={`${item.cn}: ${item.desc}`}
-          >
+        {railNavItems.map((item, index) => {
+          const columnContent = (
+            <>
             <span className="rain-vertical-word" aria-hidden="true">
               {item.label.split("").map((letter, letterIndex) => (
                 <span
@@ -177,7 +169,7 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
               <span className="rain-task-container">
                 {item.hud.map((line, lineIndex) => (
                   <span
-                    key={line}
+                    key={`${item.href}:hud:${lineIndex}`}
                     className="rain-task-item"
                     style={{ "--task-delay": `${lineIndex * 160}ms` } as CSSProperties}
                   >
@@ -187,47 +179,76 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
                 ))}
               </span>
             </span>
-          </Link>
-        ))}
+            </>
+          );
+
+          if (item.href) {
+            return (
+              <Link
+                key={`${item.label}:home-rail:${index}`}
+                href={item.href}
+                className={`rain-column rain-column-${index}`}
+                data-effect={item.effect}
+                aria-label={`${item.cn}: ${item.desc}`}
+              >
+                {columnContent}
+              </Link>
+            );
+          }
+
+          return (
+            <button
+              key={`${item.label}:home-rail:${index}`}
+              type="button"
+              className={`rain-column rain-column-${index}`}
+              data-effect={item.effect}
+              data-reserved="true"
+              aria-disabled="true"
+              aria-label={`${item.cn}: ${item.desc}`}
+            >
+              {columnContent}
+            </button>
+          );
+        })}
       </nav>
 
       <section className="rain-left-panel rain-sim-panel" aria-label="安全态势主视觉">
         <div className="rain-home-frame" aria-hidden="true">
           <div className="rain-home-frame-top">
-            <span>CHENGDU TARGET</span>
-            <span>{overview.globePoints.length} SOURCES</span>
+            <span>成都目标点</span>
+            <span>{overview.globePoints.length} 条来源航线</span>
           </div>
           <div className="rain-home-frame-left">
-            <p>MODE</p>
+            <p>展示口径</p>
             <strong>{modeLabel}</strong>
             <span>{overview.monitoredHost}</span>
-            <p>ACTIVE FILTER</p>
-            <strong>ALL</strong>
-            <span>VISIT / ATTACK / ANOMALY</span>
-            <p>TIME RANGE</p>
+            <p>仿真覆盖</p>
+            <strong>全部</strong>
+            <span>访问 / 攻击 / 异常</span>
+            <p>来源窗口</p>
             <strong>24H</strong>
-            <span>{formatTime(overview.sync.lastSyncAt)} LAST SYNC</span>
+            <span>{formatTime(overview.sync.lastSyncAt)} 来源刷新</span>
           </div>
           <div className="rain-home-frame-right">
-            <p>REQUESTS</p>
+            <p>请求量</p>
             <strong>{latestTraffic?.requests.toLocaleString("zh-CN") ?? "0"}</strong>
-            <span>{latestTraffic?.cachedPercent ?? 0}% CACHE HIT</span>
-            <p>THROUGHPUT</p>
+            <span>{latestTraffic?.cachedPercent ?? 0}% 缓存命中</span>
+            <p>吞吐量</p>
             <strong>{latestTraffic?.bandwidthMb ?? 0}MB</strong>
-            <span>{totalBandwidth.toLocaleString("zh-CN")}MB WINDOW</span>
-            <p>BLOCKED / SOURCES</p>
+            <span>{totalBandwidth.toLocaleString("zh-CN")}MB 展示窗口</span>
+            <p>处置 / 航线</p>
             <strong>{blockedOrChallenged}/{sourceLocations}</strong>
-            <span>{highEvents.length} HIGH RISK</span>
+            <span>{highEvents.length} 条高风险</span>
           </div>
           <div className="rain-home-flow-strip">
-            <span>FLOW THROUGHPUT</span>
+            <span>流量吞吐</span>
             <strong>{latestTraffic?.bandwidthMb ?? 0}MB</strong>
-            <span>ORIGIN {latestTraffic?.originMb ?? 0}MB</span>
+            <span>源站 {latestTraffic?.originMb ?? 0}MB</span>
           </div>
           <div className="rain-home-frame-bottom">
             <div className="rain-home-env">
-              <span>DATA MODE / {modeLabel}</span>
-              <span>SYNC / {formatTime(overview.sync.lastSyncAt)} / REFRESH {overview.sync.refreshIntervalHours}H</span>
+              <span>展示口径 / {modeLabel}</span>
+              <span>来源刷新 / {formatTime(overview.sync.lastSyncAt)} / 每 {overview.sync.refreshIntervalHours} 小时滚动</span>
             </div>
           </div>
         </div>
@@ -239,7 +260,7 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
       </section>
 
       <div className="rain-mobile-title">
-        <p>SECURITY SITUATION</p>
+        <p>安全态势</p>
         <h1>R0L1DEHOME</h1>
       </div>
     </main>

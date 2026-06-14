@@ -19,10 +19,12 @@ from .repository import (
     get_cloudflare_token,
     get_cloudflare_zone_id,
     get_event,
+    get_home_visualization_overview,
     get_monitored_host,
     get_overview,
     get_rules,
     get_settings,
+    get_situation_visualization_overview,
     get_state,
     get_sync_status,
     get_traffic_trend,
@@ -94,6 +96,34 @@ def build_analysis_filters(
     )
 
 
+def from_time_for_time_range(time_range: str | None) -> str | None:
+    if not time_range:
+        return None
+    hours_by_key = {"6h": 6, "24h": 24, "7d": 24 * 7}
+    hours = hours_by_key.get(time_range)
+    if not hours:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def build_visualization_event_filters(
+    time_range: str | None,
+    risk: str | None,
+    country: str | None,
+    attack_category: str | None,
+    rule_id: str | None,
+) -> dict[str, Any]:
+    risk_value = "high" if risk == "high+" else risk
+    return {
+        "from_time": from_time_for_time_range(time_range),
+        "country": country,
+        "risk_level": risk_value,
+        "risk_at_or_above": risk == "high+",
+        "attack_category": attack_category,
+        "rule_id": rule_id,
+    }
+
+
 def configured_origins() -> set[str]:
     raw = os.environ.get("SECURITY_ALLOWED_ORIGINS", "")
     if not raw:
@@ -117,6 +147,7 @@ def sync_worker_logs_once(limit: int = 500) -> dict[str, Any]:
     set_state("worker_log_export_cursor", str(exported.next_cursor))
     create_sync_run(
         status="success",
+        sync_type="worker_log",
         event_count=result["events"],
         aggregate_count=result["aggregates"],
         used_stale_data=False,
@@ -180,7 +211,24 @@ def status() -> dict[str, Any]:
 
 @app.get("/api/overview")
 def overview() -> dict[str, Any]:
-    return api_success(get_overview())
+    return api_success(get_home_visualization_overview())
+
+
+@app.get("/api/security/home")
+def security_home() -> dict[str, Any]:
+    return api_success(get_home_visualization_overview())
+
+
+@app.get("/api/security/situation")
+def security_situation(
+    time_range: str | None = Query(None, alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+) -> dict[str, Any]:
+    filters = build_visualization_event_filters(time_range, risk, country, attack_category, rule_id)
+    return api_success(get_situation_visualization_overview(filters))
 
 
 @app.get("/api/events")
@@ -208,10 +256,7 @@ def events(
     offset: int = 0,
 ) -> dict[str, Any]:
     if time_range and not from_time:
-        hours_by_key = {"6h": 6, "24h": 24, "7d": 24 * 7}
-        hours = hours_by_key.get(time_range)
-        if hours:
-            from_time = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        from_time = from_time_for_time_range(time_range)
     explicit_risk_level = risk_level or risk_level_camel
     risk_value = explicit_risk_level or ("high" if risk == "high+" else risk)
     filters = {
@@ -221,7 +266,7 @@ def events(
         "country": country,
         "region": region,
         "risk_level": risk_value,
-        "risk_at_or_above": bool(risk and not explicit_risk_level and risk in {"high", "high+"}),
+        "risk_at_or_above": bool(risk and not explicit_risk_level and risk == "high+"),
         "event_type": event_type or event_type_camel,
         "attack_category": attack_category,
         "rule_id": rule_id,
@@ -284,7 +329,7 @@ def worker_logs_sync(limit: int = 500) -> dict[str, Any]:
     try:
         return api_success(sync_worker_logs_once(limit=max(1, min(limit, 1000))))
     except WorkerLogClientError as error:
-        create_sync_run(status="failed", error_message=str(error), used_stale_data=True)
+        create_sync_run(status="failed", sync_type="worker_log", error_message=str(error), used_stale_data=True)
         return api_success(
             {
                 "mode": "worker_log",
@@ -313,7 +358,7 @@ def sync_run() -> dict[str, Any]:
 
     check = check_cloudflare_token(persist=True)
     if not check["zoneRead"] or not check["analyticsRead"]:
-        create_sync_run(status="failed", error_message=check["errorMessage"], used_stale_data=True)
+        create_sync_run(status="failed", sync_type="cloudflare", error_message=check["errorMessage"], used_stale_data=True)
         return api_success(
             {
                 "mode": "stale",
@@ -329,7 +374,7 @@ def sync_run() -> dict[str, Any]:
     try:
         fetched = client.fetch_zone_data(zone_id=get_cloudflare_zone_id(), token=token, host=get_monitored_host(), hours=24)
     except CloudflareClientError as error:
-        create_sync_run(status="failed", error_message=str(error), used_stale_data=True)
+        create_sync_run(status="failed", sync_type="cloudflare", error_message=str(error), used_stale_data=True)
         return api_success(
             {
                 "mode": "stale",
@@ -358,6 +403,7 @@ def sync_run() -> dict[str, Any]:
         error_message = "Cloudflare Security Events are unavailable. HTTP analytics were synced."
     create_sync_run(
         status=status_value,
+        sync_type="cloudflare",
         event_count=event_count,
         aggregate_count=aggregate_count,
         error_message=error_message,
@@ -434,7 +480,7 @@ def rules() -> dict[str, Any]:
 
 @app.get("/api/analysis/summary")
 def analysis_summary(
-    time_range: str | None = Query("24h", alias="timeRange"),
+    time_range: str | None = Query("7d", alias="timeRange"),
     risk: str | None = None,
     country: str | None = None,
     attack_category: str | None = Query(None, alias="attackCategory"),
@@ -446,7 +492,7 @@ def analysis_summary(
 
 @app.get("/api/analysis/clusters")
 def analysis_clusters(
-    time_range: str | None = Query("24h", alias="timeRange"),
+    time_range: str | None = Query("7d", alias="timeRange"),
     risk: str | None = None,
     country: str | None = None,
     attack_category: str | None = Query(None, alias="attackCategory"),
@@ -459,7 +505,7 @@ def analysis_clusters(
 
 @app.get("/api/analysis/rules")
 def analysis_rules(
-    time_range: str | None = Query("24h", alias="timeRange"),
+    time_range: str | None = Query("7d", alias="timeRange"),
     risk: str | None = None,
     country: str | None = None,
     attack_category: str | None = Query(None, alias="attackCategory"),
@@ -472,7 +518,7 @@ def analysis_rules(
 
 @app.get("/api/analysis/sources")
 def analysis_sources(
-    time_range: str | None = Query("24h", alias="timeRange"),
+    time_range: str | None = Query("7d", alias="timeRange"),
     risk: str | None = None,
     country: str | None = None,
     attack_category: str | None = Query(None, alias="attackCategory"),
@@ -485,7 +531,7 @@ def analysis_sources(
 
 @app.get("/api/analysis/advice")
 def analysis_advice(
-    time_range: str | None = Query("24h", alias="timeRange"),
+    time_range: str | None = Query("7d", alias="timeRange"),
     risk: str | None = None,
     country: str | None = None,
     attack_category: str | None = Query(None, alias="attackCategory"),

@@ -31,6 +31,18 @@ def _json_loads(value: str | None, fallback: Any) -> Any:
 
 SENSITIVE_KEY_PARTS = ("token", "authorization", "api_key", "apikey", "secret", "password")
 SPECIFIC_PRIMARY_RULE_TYPES = {"path_keyword", "query_keyword", "user_agent_keyword"}
+SYNC_TYPE_CLOUDFLARE = "cloudflare"
+SYNC_TYPE_WORKER_LOG = "worker_log"
+COUNTRY_AGGREGATE_SOURCES = (SYNC_TYPE_CLOUDFLARE, SYNC_TYPE_WORKER_LOG)
+GLOBE_PRIMARY_VISIBLE_LIMIT = 18
+GLOBE_RAW_SECURITY_LIMIT = GLOBE_PRIMARY_VISIBLE_LIMIT // 2
+GLOBE_RAW_COUNTRY_LIMIT = max(1, GLOBE_PRIMARY_VISIBLE_LIMIT // 4)
+GLOBE_RAW_CLIENT_IP_LIMIT = 1
+HOME_GLOBE_POINT_LIMIT = 72
+HOME_RAW_SECURITY_LIMIT = 36
+HOME_RAW_COUNTRY_LIMIT = 4
+HOME_RAW_CLIENT_IP_LIMIT = 1
+SECURITY_GLOBE_ACTIONS = ("block", "challenge", "managed_challenge", "js_challenge", "log", "simulate")
 
 
 def _sanitize_sensitive(value: Any) -> Any:
@@ -590,6 +602,7 @@ def seed_sample_dataset(
 def create_sync_run(
     *,
     status: str,
+    sync_type: str = SYNC_TYPE_CLOUDFLARE,
     event_count: int = 0,
     aggregate_count: int = 0,
     error_message: str | None = None,
@@ -602,11 +615,12 @@ def create_sync_run(
         connection.execute(
             """
             INSERT INTO sync_runs (
-                started_at, finished_at, status, from_time, to_time,
+                sync_type, started_at, finished_at, status, from_time, to_time,
                 event_count, aggregate_count, error_message, used_stale_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                sync_type,
                 now,
                 now,
                 status,
@@ -619,18 +633,38 @@ def create_sync_run(
             ),
         )
         if status in {"success", "sample"}:
-            connection.execute(
-                """
-                INSERT INTO app_state (key, value) VALUES ('last_success_sync_at', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (now,),
-            )
+            state_keys = [f"last_success_{sync_type}_sync_at"]
+            if sync_type == SYNC_TYPE_CLOUDFLARE:
+                state_keys.append("last_success_sync_at")
+            for state_key in state_keys:
+                connection.execute(
+                    """
+                    INSERT INTO app_state (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (state_key, now),
+                )
 
 
-def get_last_sync_row() -> Any | None:
+def get_last_sync_row(sync_type: str | None = None) -> Any | None:
     with db_session() as connection:
+        if sync_type:
+            return connection.execute("SELECT * FROM sync_runs WHERE sync_type = ? ORDER BY id DESC LIMIT 1", (sync_type,)).fetchone()
         return connection.execute("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def get_last_success_sync_row(sync_type: str) -> Any | None:
+    with db_session() as connection:
+        return connection.execute(
+            """
+            SELECT * FROM sync_runs
+            WHERE sync_type = ?
+              AND status IN ('success', 'sample')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (sync_type,),
+        ).fetchone()
 
 
 def get_last_token_check() -> dict[str, Any] | None:
@@ -698,46 +732,93 @@ def permissions_from_token_check(check: dict[str, Any] | None) -> list[dict[str,
     ]
 
 
-def get_sync_status() -> dict[str, Any]:
-    last_sync = get_last_sync_row()
-    token_check = get_last_token_check()
-    sample = is_sample_mode()
-    event_count, aggregate_count = get_counts()
+def _sync_mode(status: str, used_stale: bool, sample: bool = False) -> str:
+    if sample:
+        return "sample"
+    if status in {"degraded", "partial"}:
+        return "degraded"
+    if status == "failed" and used_stale:
+        return "stale"
+    if status == "failed":
+        return "degraded"
+    return "live"
+
+
+def _sync_state_from_row(
+    row: Any | None,
+    *,
+    sync_type: str,
+    fallback_error: str,
+    sample: bool = False,
+    last_success_row: Any | None = None,
+) -> dict[str, Any]:
     now = utc_now()
-    if last_sync:
-        status = "sample" if sample else last_sync["status"]
-        last_sync_at = last_sync["finished_at"] or last_sync["started_at"]
-        api_error = last_sync["error_message"]
-        used_stale = bool(last_sync["used_stale_data"])
+    if row:
+        status = "sample" if sample else row["status"]
+        last_sync_at = row["finished_at"] or row["started_at"]
+        api_error = row["error_message"]
+        used_stale = bool(row["used_stale_data"])
+        event_count = int(row["event_count"])
+        aggregate_count = int(row["aggregate_count"])
     else:
         status = "sample" if sample else "failed"
         last_sync_at = now
-        api_error = "未配置 Cloudflare Token，当前自动展示样例数据。" if sample else "尚未执行同步。"
+        api_error = fallback_error
         used_stale = False
-    if sample:
-        mode = "sample"
-    elif status == "degraded":
-        mode = "degraded"
-    elif status == "partial":
-        mode = "degraded"
-    elif status == "failed" and used_stale:
-        mode = "stale"
-    elif status == "failed":
-        mode = "degraded"
+        event_count = 0
+        aggregate_count = 0
+    if last_success_row:
+        last_success_at = last_success_row["finished_at"] or last_success_row["started_at"]
+    elif status in {"success", "sample"}:
+        last_success_at = last_sync_at
     else:
-        mode = "live"
+        last_success_at = ""
+    mode = _sync_mode(status, used_stale, sample)
     return {
+        "syncType": sync_type,
+        "source": sync_type,
         "status": status,
         "mode": mode,
-        "cloudflareLive": mode == "live",
+        "cloudflareLive": sync_type == SYNC_TYPE_CLOUDFLARE and mode == "live",
         "lastSyncAt": last_sync_at,
-        "lastSuccessAt": get_state("last_success_sync_at", last_sync_at),
+        "lastSuccessAt": last_success_at,
         "usedStaleData": used_stale,
         "apiError": api_error,
+        "eventCount": event_count,
+        "aggregateCount": aggregate_count,
+    }
+
+
+def get_sync_status() -> dict[str, Any]:
+    last_sync = get_last_sync_row(SYNC_TYPE_CLOUDFLARE)
+    last_success_sync = get_last_success_sync_row(SYNC_TYPE_CLOUDFLARE)
+    worker_sync = get_last_sync_row(SYNC_TYPE_WORKER_LOG)
+    worker_success_sync = get_last_success_sync_row(SYNC_TYPE_WORKER_LOG)
+    token_check = get_last_token_check()
+    sample = is_sample_mode()
+    event_count, aggregate_count = get_counts()
+    cloudflare_state = _sync_state_from_row(
+        last_sync,
+        sync_type=SYNC_TYPE_CLOUDFLARE,
+        fallback_error="未配置 Cloudflare Token，当前自动展示样例数据。" if sample else "尚未执行 Cloudflare 官方同步。",
+        sample=sample,
+        last_success_row=last_success_sync,
+    )
+    worker_state = _sync_state_from_row(
+        worker_sync,
+        sync_type=SYNC_TYPE_WORKER_LOG,
+        fallback_error="尚未执行 Worker/D1 访问日志同步。",
+        sample=False,
+        last_success_row=worker_success_sync,
+    )
+    return {
+        **cloudflare_state,
         "localEventCount": event_count,
         "aggregateCount": aggregate_count,
         "refreshIntervalHours": get_int_state("refresh_interval_hours", DEFAULT_REFRESH_INTERVAL_HOURS),
         "permissions": permissions_from_token_check(token_check),
+        "cloudflare": cloudflare_state,
+        "workerLog": worker_state,
     }
 
 
@@ -1060,42 +1141,144 @@ def get_worker_log_country_globe_points(limit: int = 50) -> list[dict[str, Any]]
     return get_country_aggregate_globe_points("worker_log", limit)
 
 
-def get_raw_event_globe_points(limit: int = 50) -> list[dict[str, Any]]:
-    source_clause, source_params = active_source_filter()
-    security_filter = ""
-    if not is_sample_mode():
-        security_filter = " AND (risk_level != 'info' OR action IN ('block', 'challenge', 'managed_challenge', 'js_challenge', 'log', 'simulate'))"
+def get_combined_country_aggregate_globe_points(limit: int = 50) -> list[dict[str, Any]]:
+    if is_sample_mode() or limit <= 0:
+        return []
+    dimensions = tuple(f"{source}:country" for source in COUNTRY_AGGREGATE_SOURCES)
     with db_session() as connection:
         rows = connection.execute(
             """
             SELECT
+                dimension_value,
+                SUM(total_count) AS total_count,
+                SUM(bandwidth_bytes) AS bandwidth_bytes,
+                SUM(CASE WHEN dimension = 'cloudflare:country' THEN total_count ELSE 0 END) AS cloudflare_count,
+                SUM(CASE WHEN dimension = 'worker_log:country' THEN total_count ELSE 0 END) AS worker_log_count
+            FROM event_aggregates
+            WHERE dimension IN (?, ?) AND dimension_value != ''
+            GROUP BY dimension_value
+            ORDER BY
+                CASE WHEN cloudflare_count > 0 THEN 0 ELSE 1 END ASC,
+                cloudflare_count DESC,
+                total_count DESC,
+                dimension_value ASC
+            LIMIT ?
+            """,
+            (*dimensions, limit),
+        ).fetchall()
+
+    points = []
+    for row in rows:
+        country = str(row["dimension_value"])
+        count = int(row["total_count"] or 0)
+        bandwidth_bytes = int(row["bandwidth_bytes"] or 0)
+        cloudflare_count = int(row["cloudflare_count"] or 0)
+        worker_log_count = int(row["worker_log_count"] or 0)
+        latitude, longitude, location_precision = stable_country_coordinates(country)
+        source_label = "cloudflare" if cloudflare_count > 0 else "worker_log"
+        points.append(
+            {
+                "id": f"combined:country:{country}",
+                "label": f"{country} normal_visit",
+                "clientIp": "",
+                "country": country,
+                "city": "",
+                "latitude": latitude,
+                "longitude": longitude,
+                "count": count,
+                "riskLevel": "info",
+                "eventType": "normal_visit",
+                "locationPrecision": location_precision,
+                "action": "allow",
+                "source": f"{source_label}_aggregate",
+                "sourceType": "normal_visit",
+                "trafficKind": "visit",
+                "bandwidthBytes": bandwidth_bytes,
+                "throughputMb": round(bandwidth_bytes / 1024 / 1024, 1),
+                "cloudflareCount": cloudflare_count,
+                "workerLogCount": worker_log_count,
+            }
+        )
+    return points
+
+
+def raw_security_globe_clause() -> tuple[str, list[Any]]:
+    if is_sample_mode():
+        return "", []
+    placeholders = ",".join("?" for _ in SECURITY_GLOBE_ACTIONS)
+    return f" AND (risk_level != ? OR action IN ({placeholders}))", ["info", *SECURITY_GLOBE_ACTIONS]
+
+
+def stable_globe_point_id(prefix: str, *values: Any) -> str:
+    parts = [str(value or "unknown").strip().replace(":", "_").replace("|", "_") or "unknown" for value in values]
+    return f"{prefix}:{':'.join(parts)}"
+
+
+def dedupe_globe_points(points: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for point in points:
+        key = (
+            point.get("sourceType"),
+            point.get("trafficKind"),
+            point.get("clientIp"),
+            point.get("country"),
+            point.get("city"),
+            point.get("latitude"),
+            point.get("longitude"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(point)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def get_raw_event_globe_points(
+    limit: int = 50,
+    filters: dict[str, Any] | None = None,
+    *,
+    stable_ids: bool = False,
+    security_only: bool = True,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    where_sql, params = _event_filter_sql(filters or {})
+    security_clause, security_params = raw_security_globe_clause() if security_only else ("", [])
+    filtered_where_sql = f"{where_sql}{security_clause}"
+    filtered_params = [*params, *security_params]
+    with db_session() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
                 client_ip, country, city, latitude, longitude, location_precision,
                 COUNT(*) AS count
             FROM raw_events
-            WHERE """ + source_clause + security_filter + """
+            {filtered_where_sql}
             GROUP BY client_ip, country, city, latitude, longitude, location_precision
             ORDER BY count DESC
             LIMIT ?
             """,
-            (*source_params, limit),
+            (*filtered_params, limit),
         ).fetchall()
         latest_rows = [
             connection.execute(
                 f"""
                 SELECT * FROM raw_events
-                WHERE {source_clause}
+                {filtered_where_sql}
                     AND client_ip = ?
                     AND country = ?
                     AND city = ?
                     AND latitude = ?
                     AND longitude = ?
                     AND location_precision = ?
-                    {security_filter}
                 ORDER BY occurred_at DESC
                 LIMIT 1
                 """,
                 (
-                    *source_params,
+                    *filtered_params,
                     row["client_ip"],
                     row["country"],
                     row["city"],
@@ -1110,9 +1293,21 @@ def get_raw_event_globe_points(limit: int = 50) -> list[dict[str, Any]]:
     points = []
     for row, latest_row in zip(rows, latest_rows):
         latest = row_to_event(latest_row) if latest_row else {}
+        point_id = (
+            stable_globe_point_id(
+                "raw:security",
+                row["client_ip"],
+                row["country"],
+                row["city"],
+                row["latitude"],
+                row["longitude"],
+            )
+            if stable_ids
+            else latest.get("id", row["client_ip"])
+        )
         points.append(
             {
-                "id": latest.get("id", row["client_ip"]),
+                "id": point_id,
                 "label": f"{row['city']} {latest.get('eventType', '访问')}".strip(),
                 "clientIp": row["client_ip"],
                 "country": row["country"],
@@ -1139,16 +1334,98 @@ def get_raw_event_globe_points(limit: int = 50) -> list[dict[str, Any]]:
     return points
 
 
+def limit_raw_globe_points(
+    points: list[dict[str, Any]],
+    limit: int,
+    *,
+    country_limit: int,
+    client_ip_limit: int,
+) -> list[dict[str, Any]]:
+    selected = []
+    country_counts: dict[str, int] = {}
+    client_ip_counts: dict[str, int] = {}
+    for point in points:
+        country = str(point.get("country") or "")
+        client_ip = str(point.get("clientIp") or "")
+        if country and country_counts.get(country, 0) >= country_limit:
+            continue
+        if client_ip and client_ip_counts.get(client_ip, 0) >= client_ip_limit:
+            continue
+        selected.append(point)
+        if country:
+            country_counts[country] = country_counts.get(country, 0) + 1
+        if client_ip:
+            client_ip_counts[client_ip] = client_ip_counts.get(client_ip, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def get_globe_points(limit: int = 50) -> list[dict[str, Any]]:
-    security_points = get_raw_event_globe_points(min(limit, 10))
+    if is_sample_mode():
+        return get_raw_event_globe_points(min(limit, 10))
+    raw_points = get_raw_event_globe_points(max(limit, GLOBE_PRIMARY_VISIBLE_LIMIT))
+    security_points = limit_raw_globe_points(
+        raw_points,
+        min(limit, GLOBE_RAW_SECURITY_LIMIT),
+        country_limit=GLOBE_RAW_COUNTRY_LIMIT,
+        client_ip_limit=GLOBE_RAW_CLIENT_IP_LIMIT,
+    )
     visit_limit = max(0, limit - len(security_points))
-    worker_visit_points = get_worker_log_country_globe_points(visit_limit)
-    remaining = max(0, visit_limit - len(worker_visit_points))
     return [
         *security_points,
-        *worker_visit_points,
-        *get_cloudflare_country_globe_points(remaining),
+        *get_combined_country_aggregate_globe_points(visit_limit),
     ]
+
+
+def get_home_visualization_globe_points(limit: int = HOME_GLOBE_POINT_LIMIT) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    if is_sample_mode():
+        return dedupe_globe_points(
+            get_raw_event_globe_points(min(limit, HOME_GLOBE_POINT_LIMIT), stable_ids=True, security_only=False),
+            limit,
+        )
+    raw_points = get_raw_event_globe_points(max(limit, HOME_RAW_SECURITY_LIMIT), stable_ids=True)
+    security_points = limit_raw_globe_points(
+        raw_points,
+        min(limit, HOME_RAW_SECURITY_LIMIT),
+        country_limit=HOME_RAW_COUNTRY_LIMIT,
+        client_ip_limit=HOME_RAW_CLIENT_IP_LIMIT,
+    )
+    visit_limit = max(0, limit - len(security_points))
+    return dedupe_globe_points(
+        [
+            *security_points,
+            *get_combined_country_aggregate_globe_points(visit_limit),
+        ],
+        limit,
+    )
+
+
+def get_situation_visualization_globe_points(filters: dict[str, Any] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    if is_sample_mode():
+        return dedupe_globe_points(
+            get_raw_event_globe_points(min(limit, 10), filters, stable_ids=True, security_only=False),
+            limit,
+        )
+    raw_points = get_raw_event_globe_points(max(limit, GLOBE_PRIMARY_VISIBLE_LIMIT), filters, stable_ids=True)
+    security_points = limit_raw_globe_points(
+        raw_points,
+        min(limit, GLOBE_RAW_SECURITY_LIMIT),
+        country_limit=GLOBE_RAW_COUNTRY_LIMIT,
+        client_ip_limit=GLOBE_RAW_CLIENT_IP_LIMIT,
+    )
+    visit_limit = max(0, limit - len(security_points))
+    return dedupe_globe_points(
+        [
+            *security_points,
+            *get_combined_country_aggregate_globe_points(visit_limit),
+        ],
+        limit,
+    )
 
 
 def aggregate_dimension_items(dimension: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -1171,6 +1448,32 @@ def aggregate_dimension_items(dimension: str, limit: int = 10) -> list[dict[str,
     return [{"label": str(row["dimension_value"]), "value": int(row["total_count"])} for row in rows]
 
 
+def aggregate_country_dimension_items(limit: int = 10) -> list[dict[str, Any]]:
+    if is_sample_mode() or limit <= 0:
+        return []
+    dimensions = tuple(f"{source}:country" for source in COUNTRY_AGGREGATE_SOURCES)
+    with db_session() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                dimension_value,
+                SUM(total_count) AS total_count,
+                SUM(CASE WHEN dimension = 'cloudflare:country' THEN total_count ELSE 0 END) AS cloudflare_count
+            FROM event_aggregates
+            WHERE dimension IN (?, ?) AND dimension_value != ''
+            GROUP BY dimension_value
+            ORDER BY
+                CASE WHEN cloudflare_count > 0 THEN 0 ELSE 1 END ASC,
+                cloudflare_count DESC,
+                total_count DESC,
+                dimension_value ASC
+            LIMIT ?
+            """,
+            (*dimensions, limit),
+        ).fetchall()
+    return [{"label": str(row["dimension_value"]), "value": int(row["total_count"])} for row in rows]
+
+
 def aggregate_ranked_items(dimension: str, detail: str, limit: int = 5) -> list[dict[str, Any]]:
     return [
         {
@@ -1183,9 +1486,25 @@ def aggregate_ranked_items(dimension: str, detail: str, limit: int = 5) -> list[
     ]
 
 
-def get_overview() -> dict[str, Any]:
+def aggregate_country_ranked_items(detail: str, limit: int = 5) -> list[dict[str, Any]]:
+    return [
+        {
+            "label": item["label"],
+            "value": item["value"],
+            "detail": detail,
+            "riskLevel": "info",
+        }
+        for item in aggregate_country_dimension_items(limit)
+    ]
+
+
+def get_overview(
+    *,
+    globe_points: list[dict[str, Any]] | None = None,
+    recent_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     trend = get_traffic_trend()
-    recent_events = list_events({"limit": 6})
+    overview_recent_events = recent_events if recent_events is not None else list_events({"limit": 6})
     status_codes = _distribution("status_code")
     for item in status_codes:
         try:
@@ -1217,10 +1536,10 @@ def get_overview() -> dict[str, Any]:
     if not top_paths and not is_sample_mode():
         top_paths = aggregate_ranked_items(preferred_live_aggregate_dimension("path"), "HTTP path")
     if not is_sample_mode():
-        aggregate_countries = aggregate_ranked_items(preferred_live_aggregate_dimension("country"), "Request distribution")
+        aggregate_countries = aggregate_country_ranked_items("Request distribution")
         if aggregate_countries:
             countries = aggregate_countries
-    points = get_globe_points()
+    points = globe_points if globe_points is not None else get_globe_points()
 
     total_24h = sum(point["requests"] for point in trend)
     total_6h = sum(point["requests"] for point in trend[-3:])
@@ -1253,8 +1572,21 @@ def get_overview() -> dict[str, Any]:
         "countries": countries,
         "globePoints": points,
         "sync": get_sync_status(),
-        "recentEvents": recent_events,
+        "recentEvents": overview_recent_events,
     }
+
+
+def get_home_visualization_overview() -> dict[str, Any]:
+    return get_overview(globe_points=get_home_visualization_globe_points())
+
+
+def get_situation_visualization_overview(filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    event_filters = dict(filters or {})
+    event_filters["limit"] = 6
+    return get_overview(
+        globe_points=get_situation_visualization_globe_points(filters),
+        recent_events=list_events(event_filters),
+    )
 
 
 def count_risk_at_or_above(threshold: str) -> int:

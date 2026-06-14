@@ -154,6 +154,7 @@ SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS sync_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sync_type TEXT NOT NULL DEFAULT 'cloudflare',
         started_at TEXT NOT NULL,
         finished_at TEXT,
         status TEXT NOT NULL,
@@ -395,7 +396,53 @@ def _add_missing_columns(
             connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
 
 
+def _backfill_sync_run_types(connection: sqlite3.Connection) -> None:
+    if "sync_type" not in _table_columns(connection, "sync_runs"):
+        return
+    connection.execute(
+        """
+        UPDATE sync_runs
+        SET sync_type = 'worker_log'
+        WHERE (sync_type IS NULL OR sync_type = 'cloudflare')
+          AND (
+              error_message LIKE 'SECURITY_WORKER_LOG_EXPORT_%'
+              OR error_message LIKE 'Worker log export %'
+          )
+        """
+    )
+    connection.execute(
+        """
+        UPDATE sync_runs
+        SET sync_type = NULL
+        WHERE sync_type = 'cloudflare'
+          AND from_time IS NULL
+          AND to_time IS NULL
+          AND status NOT IN ('sample', 'failed', 'degraded')
+        """
+    )
+    connection.execute(
+        """
+        UPDATE sync_runs
+        SET sync_type = 'cloudflare'
+        WHERE sync_type IS NULL
+          AND (
+              from_time IS NOT NULL
+              OR to_time IS NOT NULL
+              OR status = 'sample'
+          )
+        """
+    )
+
+
 def _apply_schema_migrations(connection: sqlite3.Connection) -> None:
+    _add_missing_columns(
+        connection,
+        "sync_runs",
+        {
+            "sync_type": "sync_type TEXT",
+        },
+    )
+    _backfill_sync_run_types(connection)
     _add_missing_columns(
         connection,
         "raw_events",
@@ -483,5 +530,6 @@ def init_db() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_analysis_time ON raw_events (occurred_at, risk_level, country, attack_category, rule_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_access_logs_analysis_time ON access_logs (occurred_at, country, client_ip)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_event_aggregates_analysis_country ON event_aggregates (dimension, bucket_start, dimension_value)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_sync_runs_type ON sync_runs (sync_type, id DESC)")
         _insert_default_state(connection)
         _insert_default_rules(connection)

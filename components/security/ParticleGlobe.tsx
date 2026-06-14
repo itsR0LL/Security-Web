@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import type { GlobePoint, RiskLevel } from "@/lib/security-data";
+import { resolveTrafficKind, type GlobePoint, type RiskLevel, type TrafficKind } from "@/lib/security-data";
 
 type ProjectionMode = "globe" | "map";
 
@@ -75,6 +75,7 @@ type TargetMarker = {
 
 type AttackFlight = {
   point: GlobePoint;
+  kind: "attack" | "visit";
   beamGeometry: THREE.BufferGeometry;
   beamMaterial: THREE.PointsMaterial;
   beamPositions: Float32Array;
@@ -119,12 +120,83 @@ const riskWeight: Record<RiskLevel, number> = {
   critical: 4,
 };
 
+const attackActions = new Set<NonNullable<GlobePoint["action"]>>([
+  "block",
+  "blocked",
+  "challenge",
+  "managed_challenge",
+  "js_challenge",
+  "log",
+  "simulate",
+]);
+const ATTACK_FLIGHT_LIMIT = 16;
+const VISIT_FLIGHT_LIMIT = 6;
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
 function smooth(value: number) {
   return value * value * (3 - 2 * value);
+}
+
+function isAttackFlightPoint(point: GlobePoint) {
+  return riskWeight[point.riskLevel] >= 2 || (point.action ? attackActions.has(point.action) : false);
+}
+
+function pointTrafficKind(point: GlobePoint): TrafficKind {
+  if (point.sourceType === "normal_visit") {
+    return "visit";
+  }
+
+  if (point.trafficKind) {
+    return point.trafficKind;
+  }
+
+  return resolveTrafficKind(point);
+}
+
+function isVisitFlightPoint(point: GlobePoint) {
+  return !isAttackFlightPoint(point) && pointTrafficKind(point) === "visit";
+}
+
+function pickVisitFlightPoints(points: GlobePoint[], skippedPointIds: Set<string>) {
+  const visitPoints = points
+    .filter((point) => !skippedPointIds.has(point.id) && isVisitFlightPoint(point))
+    .sort((left, right) => right.count - left.count);
+  const selectedPoints: GlobePoint[] = [];
+  const selectedPointIds = new Set<string>();
+  const selectedCountries = new Set<string>();
+
+  for (const point of visitPoints) {
+    if (selectedPoints.length >= VISIT_FLIGHT_LIMIT) {
+      return selectedPoints;
+    }
+
+    const countryKey = point.country.trim() || point.id;
+    if (selectedCountries.has(countryKey)) {
+      continue;
+    }
+
+    selectedPoints.push(point);
+    selectedPointIds.add(point.id);
+    selectedCountries.add(countryKey);
+  }
+
+  for (const point of visitPoints) {
+    if (selectedPoints.length >= VISIT_FLIGHT_LIMIT) {
+      break;
+    }
+
+    if (selectedPointIds.has(point.id)) {
+      continue;
+    }
+
+    selectedPoints.push(point);
+    selectedPointIds.add(point.id);
+  }
+
+  return selectedPoints;
 }
 
 function wrapMapX(value: number) {
@@ -456,10 +528,16 @@ function createAttackFlight(
   point: GlobePoint,
   index: number,
   texture: THREE.Texture,
+  kind: AttackFlight["kind"] = "attack",
 ): AttackFlight {
-  const color = new THREE.Color(riskColors[point.riskLevel] ?? "#b2f2bb").lerp(new THREE.Color("#fff3d6"), 0.16);
+  const isVisit = kind === "visit";
+  const visualRiskLevel = isVisit ? (point.riskLevel === "low" ? "low" : "info") : point.riskLevel;
+  const color = new THREE.Color(riskColors[visualRiskLevel] ?? "#b2f2bb").lerp(
+    new THREE.Color(isVisit ? "#dffcff" : "#fff3d6"),
+    isVisit ? 0.22 : 0.16,
+  );
   const rank = riskWeight[point.riskLevel];
-  const sampleCount = 96;
+  const sampleCount = isVisit ? 72 : 96;
   const positions = new Float32Array(sampleCount * 3);
   const colors = new Float32Array(sampleCount * 3);
   positions.fill(999);
@@ -473,9 +551,9 @@ function createAttackFlight(
   const beamMaterial = new THREE.PointsMaterial({
     color: "#ffffff",
     map: texture,
-    size: 0.028 + rank * 0.002,
+    size: isVisit ? 0.017 + Math.min(rank, 1) * 0.001 : 0.028 + rank * 0.002,
     transparent: true,
-    opacity: 0.7,
+    opacity: isVisit ? 0.42 : 0.7,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     depthTest: false,
@@ -484,7 +562,7 @@ function createAttackFlight(
   });
   const beamParticles = new THREE.Points(geometry, beamMaterial);
   beamParticles.frustumCulled = false;
-  beamParticles.renderOrder = 20;
+  beamParticles.renderOrder = isVisit ? 18 : 20;
 
   const impactGeometry = new THREE.BufferGeometry();
   const impactPosition = new Float32Array(3);
@@ -492,7 +570,7 @@ function createAttackFlight(
   const impactMaterial = new THREE.PointsMaterial({
     color,
     map: texture,
-    size: 0.052 + rank * 0.004,
+    size: isVisit ? 0.032 + Math.min(rank, 1) * 0.002 : 0.052 + rank * 0.004,
     transparent: true,
     opacity: 0,
     blending: THREE.AdditiveBlending,
@@ -503,11 +581,12 @@ function createAttackFlight(
   impactGeometry.setAttribute("position", new THREE.BufferAttribute(impactPosition, 3));
   const impact = new THREE.Points(impactGeometry, impactMaterial);
   impact.frustumCulled = false;
-  impact.renderOrder = 21;
+  impact.renderOrder = isVisit ? 19 : 21;
   impact.visible = false;
 
   return {
     point,
+    kind,
     beamGeometry: geometry,
     beamMaterial,
     beamPositions: positions,
@@ -517,8 +596,10 @@ function createAttackFlight(
     impactGeometry,
     impactMaterial,
     impactPosition,
-    phaseMs: seeded(seed + 11) * 3600,
-    durationMs: clamp(3600 - rank * 280 + seeded(seed + 23) * 900, 2400, 4200),
+    phaseMs: seeded(seed + 11) * (isVisit ? 6200 : 3600),
+    durationMs: isVisit
+      ? clamp(5600 + seeded(seed + 23) * 1700, 5200, 7800)
+      : clamp(3600 - rank * 280 + seeded(seed + 23) * 900, 2400, 4200),
     sampleCount,
     seed,
   };
@@ -687,21 +768,21 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
       globeGroup.add(marker.particles);
     });
 
-    points
-      .filter(
-        (point) =>
-          riskWeight[point.riskLevel] >= 2 ||
-          ["block", "blocked", "challenge", "managed_challenge", "js_challenge", "log", "simulate"].includes(point.action ?? ""),
-      )
-      .slice(0, 16)
-      .forEach((point, index) => {
-        const flight = createAttackFlight(point, index, particleTexture);
-        flight.beamParticles.userData.hoverPoint = point;
-        flight.impact.userData.hoverPoint = point;
-        attackFlights.push(flight);
-        globeGroup.add(flight.beamParticles);
-        globeGroup.add(flight.impact);
-      });
+    const attackFlightPoints = points.filter(isAttackFlightPoint).slice(0, ATTACK_FLIGHT_LIMIT);
+    const attackFlightPointIds = new Set(attackFlightPoints.map((point) => point.id));
+    const visitFlightPoints = pickVisitFlightPoints(points, attackFlightPointIds);
+
+    [
+      ...attackFlightPoints.map((point) => ({ point, kind: "attack" as const })),
+      ...visitFlightPoints.map((point) => ({ point, kind: "visit" as const })),
+    ].forEach(({ point, kind }, index) => {
+      const flight = createAttackFlight(point, index, particleTexture, kind);
+      flight.beamParticles.userData.hoverPoint = point;
+      flight.impact.userData.hoverPoint = point;
+      attackFlights.push(flight);
+      globeGroup.add(flight.beamParticles);
+      globeGroup.add(flight.impact);
+    });
 
     fetch("/data/ne-110m-countries.geojson")
       .then((response) => response.json() as Promise<CountryFeatureCollection>)
@@ -999,12 +1080,18 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
 
       attackFlights.forEach((flight) => {
         const progress = ((elapsed + flight.phaseMs) % flight.durationMs) / flight.durationMs;
+        const isVisit = flight.kind === "visit";
         const rank = riskWeight[flight.point.riskLevel];
-        const active = progress > 0.035 && progress < 0.99;
-        const beamLength = 0.25 + rank * 0.014;
+        const visualRank = isVisit ? Math.min(rank, 1) : rank;
+        const active = isVisit ? progress > 0.05 && progress < 0.96 : progress > 0.035 && progress < 0.99;
+        const beamLength = isVisit ? 0.16 : 0.25 + rank * 0.014;
         const beamStart = Math.max(0, progress - beamLength);
         const beamSpan = Math.max(0.001, progress - beamStart);
-        const baseColor = new THREE.Color(riskColors[flight.point.riskLevel]).lerp(new THREE.Color("#fff0c6"), 0.14);
+        const visualRiskLevel = isVisit ? (flight.point.riskLevel === "low" ? "low" : "info") : flight.point.riskLevel;
+        const baseColor = new THREE.Color(riskColors[visualRiskLevel]).lerp(
+          new THREE.Color(isVisit ? "#dffcff" : "#fff0c6"),
+          isVisit ? 0.2 : 0.14,
+        );
         const sampleFlightRoute = (pathProgress: number) => {
           return sampleRoute(
             flight.point,
@@ -1016,8 +1103,8 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
             flight.seed,
           );
         };
-        const fadeIn = smooth(clamp(progress / 0.1, 0, 1));
-        const fadeOut = 1 - smooth(clamp((progress - 0.91) / 0.09, 0, 1));
+        const fadeIn = smooth(clamp(progress / (isVisit ? 0.14 : 0.1), 0, 1));
+        const fadeOut = 1 - smooth(clamp((progress - (isVisit ? 0.84 : 0.91)) / (isVisit ? 0.12 : 0.09), 0, 1));
         const lifecycle = active ? fadeIn * fadeOut : 0;
 
         for (let index = 0; index < flight.sampleCount; index += 1) {
@@ -1028,13 +1115,14 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
           const hemisphereVisibility =
             mapEase > 0.94 ? 1 : smooth(clamp((normal.dot(viewDirection) + 0.36) / 0.8, 0, 1));
           const frontVisibility = THREE.MathUtils.lerp(0.58, 1, hemisphereVisibility);
-          const tail = Math.pow(localProgress, 2.35);
-          const head = Math.exp(-Math.pow((localProgress - 0.985) / 0.08, 2));
-          const spark = 0.88 + seeded(flight.seed + index * 19) * 0.16;
+          const tail = Math.pow(localProgress, isVisit ? 2.75 : 2.35);
+          const head = Math.exp(-Math.pow((localProgress - 0.985) / (isVisit ? 0.1 : 0.08), 2));
+          const spark = isVisit ? 0.74 + seeded(flight.seed + index * 19) * 0.12 : 0.88 + seeded(flight.seed + index * 19) * 0.16;
           const offset = index * 3;
-          const heat = clamp(head * 0.6 + tail * 0.2, 0, 0.66);
-          const hotColor = baseColor.clone().lerp(new THREE.Color("#fff0bf"), heat);
-          const intensity = lifecycle * frontVisibility * spark * (0.035 + tail * 0.48 + head * 1.1);
+          const heat = isVisit ? clamp(head * 0.28 + tail * 0.1, 0, 0.34) : clamp(head * 0.6 + tail * 0.2, 0, 0.66);
+          const hotColor = baseColor.clone().lerp(new THREE.Color(isVisit ? "#eaffff" : "#fff0bf"), heat);
+          const intensity =
+            lifecycle * frontVisibility * spark * (isVisit ? 0.016 + tail * 0.14 + head * 0.36 : 0.035 + tail * 0.48 + head * 1.1);
 
           flight.beamPositions[offset] = position.x;
           flight.beamPositions[offset + 1] = position.y;
@@ -1047,8 +1135,8 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
         (flight.beamGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
         (flight.beamGeometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
         flight.beamParticles.visible = active;
-        flight.beamMaterial.opacity = active ? 0.68 + rank * 0.035 + mapEase * 0.04 : 0;
-        flight.beamMaterial.size = (0.028 + rank * 0.0022) * (1 + mapEase * 0.14);
+        flight.beamMaterial.opacity = active ? (isVisit ? 0.32 + mapEase * 0.02 : 0.68 + rank * 0.035 + mapEase * 0.04) : 0;
+        flight.beamMaterial.size = (isVisit ? 0.017 + visualRank * 0.001 : 0.028 + rank * 0.0022) * (1 + mapEase * (isVisit ? 0.08 : 0.14));
 
         const headPosition = sampleFlightRoute(progress);
         const headNormal = headPosition.clone().normalize().lerp(SURFACE_NORMAL, mapEase).normalize();
@@ -1059,8 +1147,10 @@ export function ParticleGlobe({ points, projection = "globe", controls = false, 
         flight.impactPosition[2] = headPosition.z;
         (flight.impactGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
         flight.impact.visible = active;
-        flight.impactMaterial.opacity = lifecycle * headVisibility * (0.86 + rank * 0.055);
-        flight.impactMaterial.size = (0.052 + rank * 0.004) * (1 + Math.sin(elapsed * 0.007 + flight.seed) * 0.08);
+        flight.impactMaterial.opacity = lifecycle * headVisibility * (isVisit ? 0.24 + visualRank * 0.035 : 0.86 + rank * 0.055);
+        flight.impactMaterial.size =
+          (isVisit ? 0.032 + visualRank * 0.002 : 0.052 + rank * 0.004) *
+          (1 + Math.sin(elapsed * (isVisit ? 0.0045 : 0.007) + flight.seed) * (isVisit ? 0.04 : 0.08));
       });
     };
 

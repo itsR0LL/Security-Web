@@ -13,7 +13,7 @@ from .repository import active_source_filter, get_rules as repository_rules, is_
 
 
 TIME_RANGE_HOURS = {"6h": 6, "24h": 24, "7d": 24 * 7}
-DEFAULT_TIME_RANGE = "24h"
+DEFAULT_TIME_RANGE = "7d"
 SECURITY_ACTIONS = ("block", "blocked", "challenge", "managed_challenge", "js_challenge", "log", "simulate")
 
 
