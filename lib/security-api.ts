@@ -3,15 +3,21 @@ import {
   createAnalysisClusters,
   createAnalysisRules,
   createAnalysisSources,
+  createSampleRuleManagementData,
   createSampleSecurityData,
   type AnalysisAdviceResult,
   type AnalysisClustersResult,
   type AnalysisRulesResult,
   type AnalysisSources,
+  type CloudflareDerivedRule,
+  type ManagedSecurityRule,
   type SecurityEvent,
   type SecurityDataMode,
   type SecurityOverview,
+  type SecurityRuleDraft,
+  type SecurityRuleDraftUpdate,
   type SecurityRuleHit,
+  type SecurityRuleMutation,
   type SecuritySettings,
   type SyncStatus,
   type RiskLevel,
@@ -205,6 +211,61 @@ async function postWithFallback<T>(path: string, payload: unknown, fallback: T):
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload ?? {}),
+    });
+
+    if (!response.ok) {
+      throw new Error(`后端返回 ${response.status}`);
+    }
+
+    const body = await response.json();
+    if (body && body.success === false) {
+      throw new Error(body.message || "后端返回失败");
+    }
+
+    return {
+      data: (body?.data ?? body) as T,
+      source: "api",
+    };
+  } catch (error) {
+    return {
+      data: fallback,
+      source: "sample",
+      error: error instanceof Error ? error.message : "写入后端失败，已保留页面本地状态。",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function writeWithFallback<T>(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  payload: unknown,
+  fallback: T,
+): Promise<SecurityApiResult<T>> {
+  const baseUrl = getApiBaseUrl();
+
+  if (!baseUrl) {
+    return {
+      data: fallback,
+      source: "sample",
+      error: "未配置 SECURITY_API_BASE_URL，当前仅完成前端本地预览。",
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+
+  try {
+    const response = await fetch(joinUrl(baseUrl, path), {
+      method,
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: method === "DELETE" ? undefined : JSON.stringify(payload ?? {}),
     });
 
     if (!response.ok) {
@@ -525,6 +586,151 @@ export async function getAnalysisAdvice(query: SecurityAnalysisQuery = {}): Prom
   const sample = createSampleSecurityData();
   const clusters = createAnalysisClusters(sample.events);
   return fetchWithFallback(appendQuery("/api/analysis/advice", query), createAnalysisAdvice(clusters));
+}
+
+function listFromPayload<T>(payload: T[] | { items?: T[] } | null | undefined): T[] {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.items)) return payload.items;
+  return [];
+}
+
+function sampleRuleByDraftId(draftId: string): ManagedSecurityRule {
+  const preview = createSampleRuleManagementData();
+  const draft = preview.drafts.find((item) => item.id === draftId) ?? preview.drafts[0];
+  const ruleDraft = draft?.ruleDraft;
+  const id = ruleDraft?.id ? ruleDraft.id.replace(/^draft-/, "rule-") : draftId.replace(/^draft-/, "rule-");
+  const now = new Date().toISOString();
+  return {
+    id: id || "rule-promoted-preview",
+    name: ruleDraft?.name || "Promoted preview rule",
+    enabled: ruleDraft?.enabled ?? false,
+    mode: ruleDraft?.mode ?? "shadow",
+    ruleType: ruleDraft?.ruleType ?? "path_keyword",
+    condition: ruleDraft?.condition ?? { conditions: [] },
+    severity: ruleDraft?.severity ?? "medium",
+    version: ruleDraft?.version ?? "draft",
+    attackCategory: ruleDraft?.classification.attackCategory ?? "",
+    attackSubtype: ruleDraft?.classification.attackSubtype ?? "",
+    toolSignature: ruleDraft?.classification.toolSignature ?? "",
+    behaviorFingerprint: ruleDraft?.classification.behaviorFingerprint ?? "",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function ruleFromPromotePayload(payload: ManagedSecurityRule | { rule?: ManagedSecurityRule }): ManagedSecurityRule {
+  if (payload && "rule" in payload && payload.rule) return payload.rule;
+  return payload as ManagedSecurityRule;
+}
+
+function ruleFromMutation(payload: SecurityRuleMutation): ManagedSecurityRule {
+  const now = new Date().toISOString();
+  return {
+    ...payload,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function normalizeCloudflareDerivedRule(rule: Partial<CloudflareDerivedRule> & Record<string, unknown>): CloudflareDerivedRule {
+  const action = Array.isArray((rule.condition as Record<string, unknown> | undefined)?.actions)
+    ? String(((rule.condition as Record<string, unknown>).actions as unknown[])[0] ?? "")
+    : "";
+  const id = rule.id ? String(rule.id) : action ? `cloudflare-derived-${action}` : "cloudflare-derived-rule";
+  return {
+    id,
+    name: String(rule.name ?? (action ? `Cloudflare ${action}` : "Cloudflare derived rule")),
+    enabled: typeof rule.enabled === "boolean" ? rule.enabled : true,
+    mode: String(rule.mode ?? "active"),
+    ruleType: String(rule.ruleType ?? "cloudflare_action"),
+    condition: (rule.condition as CloudflareDerivedRule["condition"]) ?? { actions: action ? [action] : [] },
+    severity: String(rule.severity ?? rule.riskLevel ?? "medium"),
+    version: String(rule.version ?? "derived"),
+    attackCategory: String(rule.attackCategory ?? "edge_security"),
+    attackSubtype: String(rule.attackSubtype ?? (action ? `cloudflare_${action}` : "cloudflare_action")),
+    toolSignature: String(rule.toolSignature ?? "cloudflare_firewall"),
+    behaviorFingerprint: String(rule.behaviorFingerprint ?? "cloudflare_action_match"),
+    source: String(rule.source ?? "raw_events"),
+    readonly: Boolean(rule.readonly ?? rule.readOnly ?? true),
+    readOnly: Boolean(rule.readonly ?? rule.readOnly ?? true),
+    baseRuleId: rule.baseRuleId ? String(rule.baseRuleId) : undefined,
+    description: rule.description ? String(rule.description) : "Read-only rule layer derived from Cloudflare security actions.",
+    eventCount: typeof rule.eventCount === "number" ? rule.eventCount : 0,
+    firstSeen: rule.firstSeen ? String(rule.firstSeen) : undefined,
+    lastSeen: rule.lastSeen ? String(rule.lastSeen) : undefined,
+    riskLevel: rule.riskLevel ? String(rule.riskLevel) : undefined,
+  };
+}
+
+export async function getSecurityRules(): Promise<SecurityApiResult<ManagedSecurityRule[]>> {
+  const fallback = createSampleRuleManagementData().rules;
+  const result = await fetchWithFallback<ManagedSecurityRule[] | { items?: ManagedSecurityRule[] }>("/api/rules", fallback);
+  return {
+    ...result,
+    data: listFromPayload(result.data),
+  };
+}
+
+export async function refreshRuleDrafts(): Promise<SecurityApiResult<{ refreshed: boolean; items?: SecurityRuleDraft[] }>> {
+  return postWithFallback("/api/rule-drafts/refresh", {}, {
+    refreshed: true,
+    items: createSampleRuleManagementData().drafts,
+  });
+}
+
+export async function getRuleDrafts(): Promise<SecurityApiResult<SecurityRuleDraft[]>> {
+  const fallback = createSampleRuleManagementData().drafts;
+  const result = await fetchWithFallback<SecurityRuleDraft[] | AnalysisAdviceResult | { items?: SecurityRuleDraft[] }>("/api/rule-drafts", fallback);
+  return {
+    ...result,
+    data: listFromPayload(result.data),
+  };
+}
+
+export async function createSecurityRule(payload: SecurityRuleMutation): Promise<SecurityApiResult<ManagedSecurityRule>> {
+  return writeWithFallback("POST", "/api/rules", payload, ruleFromMutation(payload));
+}
+
+export async function patchSecurityRule(ruleId: string, payload: SecurityRuleMutation): Promise<SecurityApiResult<ManagedSecurityRule>> {
+  return writeWithFallback("PATCH", `/api/rules/${encodeURIComponent(ruleId)}`, payload, {
+    ...ruleFromMutation(payload),
+    id: ruleId,
+  });
+}
+
+export async function deleteSecurityRule(ruleId: string): Promise<SecurityApiResult<{ ruleId: string; deleted: boolean }>> {
+  return writeWithFallback("DELETE", `/api/rules/${encodeURIComponent(ruleId)}`, {}, { ruleId, deleted: true });
+}
+
+export async function updateRuleDraft(draftId: string, payload: SecurityRuleDraftUpdate): Promise<SecurityApiResult<SecurityRuleDraft>> {
+  const fallback = createSampleRuleManagementData().drafts.find((item) => item.id === draftId) ?? createSampleRuleManagementData().drafts[0];
+  return writeWithFallback("PATCH", `/api/rule-drafts/${encodeURIComponent(draftId)}`, payload, {
+    ...fallback,
+    ...payload,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function promoteRuleDraft(draftId: string): Promise<SecurityApiResult<ManagedSecurityRule>> {
+  const result = await writeWithFallback<ManagedSecurityRule | { rule?: ManagedSecurityRule }>(
+    "POST",
+    `/api/rule-drafts/${encodeURIComponent(draftId)}/promote`,
+    {},
+    { rule: sampleRuleByDraftId(draftId) },
+  );
+  return {
+    ...result,
+    data: ruleFromPromotePayload(result.data),
+  };
+}
+
+export async function getCloudflareDerivedRules(): Promise<SecurityApiResult<CloudflareDerivedRule[]>> {
+  const fallback = createSampleRuleManagementData().cloudflareDerived;
+  const result = await fetchWithFallback<CloudflareDerivedRule[] | { items?: CloudflareDerivedRule[] }>("/api/rules/cloudflare-derived", fallback);
+  return {
+    ...result,
+    data: listFromPayload(result.data).map((rule) => normalizeCloudflareDerivedRule(rule)),
+  };
 }
 
 export async function saveCloudflareSettings(payload: CloudflareSettingsPayload): Promise<SecurityApiResult<TokenCheckApiResult>> {

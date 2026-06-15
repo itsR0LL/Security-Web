@@ -27,9 +27,20 @@ type SecurityAnalysisConsoleProps = {
   source: "api" | "sample";
   error?: string;
   timeRange: AnalysisTimeRange;
+  filters: AnalysisFilters;
 };
 
 type AnalysisTimeRange = "6h" | "24h" | "7d" | "all";
+
+type AnalysisFilters = {
+  timeRange: AnalysisTimeRange;
+  risk?: string;
+  country?: string;
+  attackCategory?: string;
+  ruleId?: string;
+};
+
+type AnalysisFilterPatch = Partial<AnalysisFilters>;
 
 const timeRangeOptions: Array<{ value: AnalysisTimeRange; label: string; title: string }> = [
   { value: "6h", label: "06H", title: "近 6 小时" },
@@ -178,31 +189,66 @@ function ruleDraftCondition(item: AnalysisAdvice) {
   return text || "{}";
 }
 
-function analysisEventsHref(attackCategory: string, ruleId: string, extra?: Record<string, string>) {
+function setAnalysisParam(params: URLSearchParams, key: keyof AnalysisFilters, value?: string) {
+  if (!value) return;
+  if (key !== "timeRange" && value === "all") return;
+  params.set(key, value);
+}
+
+function analysisPageHref(filters: AnalysisFilters, patch: AnalysisFilterPatch = {}) {
+  const merged = { ...filters, ...patch };
   const params = new URLSearchParams();
-  if (attackCategory) params.set("attackCategory", attackCategory);
-  if (ruleId) params.set("ruleId", ruleId);
-  Object.entries(extra ?? {}).forEach(([key, value]) => {
-    if (value) params.set(key, value);
-  });
+  setAnalysisParam(params, "timeRange", merged.timeRange);
+  setAnalysisParam(params, "risk", merged.risk);
+  setAnalysisParam(params, "country", merged.country);
+  setAnalysisParam(params, "attackCategory", merged.attackCategory);
+  setAnalysisParam(params, "ruleId", merged.ruleId);
   const query = params.toString();
-  return query ? `/security/events?${query}` : "/security/events";
+  return query ? `/security/analysis?${query}` : "/security/analysis";
 }
 
-function clusterEventsHref(cluster: AnalysisCluster) {
-  return analysisEventsHref(cluster.attackCategory, cluster.ruleId);
+function clusterAnalysisHref(filters: AnalysisFilters, cluster: AnalysisCluster) {
+  return analysisPageHref(filters, {
+    attackCategory: cluster.attackCategory,
+    ruleId: cluster.ruleId,
+  });
 }
 
-function ruleEventsHref(rule: AnalysisRule) {
-  return analysisEventsHref(rule.attackCategory, rule.ruleId);
+function rulesPageHref(params: { ruleId?: string; draftId?: string; attackCategory?: string }) {
+  const searchParams = new URLSearchParams();
+  if (params.ruleId) searchParams.set("ruleId", params.ruleId);
+  if (params.draftId) searchParams.set("draftId", params.draftId);
+  if (params.attackCategory) searchParams.set("attackCategory", params.attackCategory);
+  const query = searchParams.toString();
+  return query ? `/security/rules?${query}` : "/security/rules";
 }
 
-function sourceEventsHref(item: AnalysisSources["items"][number]) {
-  return analysisEventsHref(item.topAttackCategory, item.topRuleId, { country: item.country });
+function ruleManagementHref(rule: AnalysisRule) {
+  return rulesPageHref({
+    ruleId: rule.ruleId,
+    attackCategory: rule.attackCategory,
+  });
 }
 
-function adviceEventsHref(item: AnalysisAdvice) {
-  return analysisEventsHref(item.ruleDraft.classification.attackCategory, "");
+function sourceAnalysisHref(filters: AnalysisFilters, item: AnalysisSources["items"][number]) {
+  return analysisPageHref(filters, {
+    country: item.country,
+    attackCategory: item.topAttackCategory,
+    ruleId: item.topRuleId,
+  });
+}
+
+function evidenceAnalysisHref(filters: AnalysisFilters, item: AnalysisEventEvidence) {
+  return analysisPageHref(filters, {
+    ruleId: item.ruleId,
+  });
+}
+
+function adviceRulesHref(item: AnalysisAdvice) {
+  return rulesPageHref({
+    draftId: item.id,
+    attackCategory: item.ruleDraft.classification.attackCategory,
+  });
 }
 
 function dataModeText(source: "api" | "sample", error?: string) {
@@ -220,6 +266,7 @@ export function SecurityAnalysisConsole({
   source,
   error,
   timeRange,
+  filters,
 }: SecurityAnalysisConsoleProps) {
   const { cursorRef } = useRainCursor();
   const clusterItems = clusters.items;
@@ -253,15 +300,15 @@ export function SecurityAnalysisConsole({
       <header className="analysis-hero">
         <div className="analysis-hero-copy">
           <p>SECURITY / ANALYSIS CONTROL</p>
-          <h1>分析任务控制舱</h1>
-          <span>模型聚合、证据锁定、规则覆盖与待审核指令在同一终端层级内回读。</span>
+          <h1>Threat Analysis</h1>
+          <span>Clustered signals, evidence, rules, and source context.</span>
         </div>
         <div className="analysis-hero-actions">
           <div className="analysis-time-switch" role="group" aria-label="分析时间范围">
             {timeRangeOptions.map((option) => (
               <Link
                 key={option.value}
-                href={`/security/analysis?timeRange=${option.value}`}
+                href={analysisPageHref(filters, { timeRange: option.value })}
                 title={option.title}
                 data-active={timeRange === option.value}
               >
@@ -271,6 +318,9 @@ export function SecurityAnalysisConsole({
           </div>
           <Link href="/security/events" className="analysis-command-link">
             EVENT JUMP
+          </Link>
+          <Link href="/security/rules" className="analysis-command-link">
+            RULES BAY
           </Link>
         </div>
       </header>
@@ -319,7 +369,7 @@ export function SecurityAnalysisConsole({
             {clusterItems.map((cluster, index) => (
               <Link
                 key={`${cluster.clusterId}:${index}`}
-                href={clusterEventsHref(cluster)}
+                href={clusterAnalysisHref(filters, cluster)}
                 className="analysis-cluster-row"
                 data-risk={cluster.riskLevel}
                 data-locked={index === 0}
@@ -352,7 +402,7 @@ export function SecurityAnalysisConsole({
                 <strong>{dominantCluster?.attackCategory ?? "暂无攻击信号"}</strong>
                 <span>{summaryCopy}</span>
               </div>
-              <Link href={dominantCluster ? clusterEventsHref(dominantCluster) : "/security/events"} className="analysis-command-link">
+              <Link href={dominantCluster ? clusterAnalysisHref(filters, dominantCluster) : analysisPageHref(filters)} className="analysis-command-link">
                 LOCK EVENT
               </Link>
             </div>
@@ -391,7 +441,7 @@ export function SecurityAnalysisConsole({
               {matrixEvidence.map((item, index) => (
                 <Link
                   key={`${item.id}:evidence:${index}`}
-                  href={analysisEventsHref("", item.ruleId)}
+                  href={evidenceAnalysisHref(filters, item)}
                   className="analysis-evidence-cell"
                   data-risk={item.riskLevel}
                   style={{ "--row-delay": `${index * 62}ms` } as CSSProperties}
@@ -415,7 +465,7 @@ export function SecurityAnalysisConsole({
             {ruleItems.slice(0, 7).map((rule, index) => (
               <Link
                 key={`${rule.ruleId}:rule:${index}`}
-                href={ruleEventsHref(rule)}
+                href={ruleManagementHref(rule)}
                 className="analysis-rule-row"
                 data-risk={rule.severity}
                 style={
@@ -454,7 +504,7 @@ export function SecurityAnalysisConsole({
             {sources.items.slice(0, 4).map((item, index) => (
               <Link
                 key={`${item.clientIp}:source:${index}`}
-                href={sourceEventsHref(item)}
+                href={sourceAnalysisHref(filters, item)}
                 className="analysis-source-row"
                 data-risk={item.riskLevel}
                 style={{ "--row-delay": `${index * 54}ms` } as CSSProperties}
@@ -493,7 +543,7 @@ export function SecurityAnalysisConsole({
             {adviceItems.slice(0, 4).map((item, index) => (
               <Link
                 key={`${item.id}:advice:${index}`}
-                href={adviceEventsHref(item)}
+                href={adviceRulesHref(item)}
                 className="analysis-advice-row"
                 data-risk={item.riskLevel}
                 style={{ "--row-delay": `${index * 72}ms` } as CSSProperties}

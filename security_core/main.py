@@ -16,7 +16,10 @@ from .event_normalizer import build_http_aggregate_rows, normalize_security_even
 from .ip2location import lookup_ip_location
 from .repository import (
     count_events,
+    create_rule,
     create_sync_run,
+    delete_rule,
+    get_cloudflare_derived_rules,
     get_cloudflare_token,
     get_cloudflare_zone_id,
     get_event,
@@ -31,17 +34,22 @@ from .repository import (
     get_traffic_trend,
     has_cloudflare_token,
     insert_worker_logs,
+    list_rule_drafts,
     list_events,
     map_payload,
     normalize_event_limit,
     normalize_event_offset,
+    promote_rule_draft,
     replace_cloudflare_aggregates,
-    replace_cloudflare_events,
     seed_sample_dataset,
     set_state,
     source_summary,
+    update_rule,
     update_cloudflare_settings,
+    update_rule_draft,
     update_risk_threshold,
+    upsert_rule_drafts,
+    upsert_cloudflare_events,
 )
 from .token_check import check_cloudflare_token
 from .worker_log_client import WorkerLogClientError, fetch_worker_log_export
@@ -49,6 +57,10 @@ from .worker_log_client import WorkerLogClientError, fetch_worker_log_export
 
 def api_success(data: Any, **extra: Any) -> dict[str, Any]:
     return {"success": True, "data": data, **extra}
+
+
+def bad_request(error: ValueError) -> None:
+    raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def token_check_state(check: dict[str, Any], *, sample_mode: bool = False) -> dict[str, Any]:
@@ -398,7 +410,7 @@ def sync_run() -> dict[str, Any]:
                 fetched.security_events,
                 ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection),
             )
-        event_count = replace_cloudflare_events(events_data)
+        event_count = upsert_cloudflare_events(events_data)
     else:
         used_stale_data = True
 
@@ -481,6 +493,94 @@ def save_risk_threshold(payload: dict[str, Any] | None = Body(default=None)) -> 
 @app.get("/api/rules")
 def rules() -> dict[str, Any]:
     return api_success(get_rules())
+
+
+@app.post("/api/rules")
+def create_rule_endpoint(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    try:
+        return api_success(create_rule(payload or {}))
+    except ValueError as error:
+        bad_request(error)
+
+
+@app.get("/api/rules/cloudflare-derived")
+def cloudflare_derived_rules() -> dict[str, Any]:
+    return api_success(get_cloudflare_derived_rules())
+
+
+@app.patch("/api/rules/{rule_id}")
+def update_rule_endpoint(rule_id: str, payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    try:
+        rule = update_rule(rule_id, payload or {})
+    except ValueError as error:
+        bad_request(error)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found.")
+    return api_success(rule)
+
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule_endpoint(rule_id: str) -> dict[str, Any]:
+    if not delete_rule(rule_id):
+        raise HTTPException(status_code=404, detail="Rule not found.")
+    return api_success({"id": rule_id, "deleted": True})
+
+
+@app.get("/api/rule-drafts")
+def rule_drafts(status: str | None = None) -> dict[str, Any]:
+    try:
+        return api_success(list_rule_drafts(status))
+    except ValueError as error:
+        bad_request(error)
+
+
+@app.post("/api/rule-drafts/refresh")
+def refresh_rule_drafts(
+    time_range: str | None = Query("7d", alias="timeRange"),
+    risk: str | None = None,
+    country: str | None = None,
+    attack_category: str | None = Query(None, alias="attackCategory"),
+    rule_id: str | None = Query(None, alias="ruleId"),
+    limit: int = 10,
+) -> dict[str, Any]:
+    filters = build_analysis_filters(time_range, risk, country, attack_category, rule_id)
+    advice = AttackAggregator().advice(filters, limit=limit)
+    try:
+        items = upsert_rule_drafts(advice["items"])
+    except ValueError as error:
+        bad_request(error)
+    return api_success(
+        {
+            "status": advice["status"],
+            "message": advice["message"],
+            "generatedAt": advice["generatedAt"],
+            "filters": advice["filters"],
+            "totalDrafts": len(items),
+            "items": items,
+        }
+    )
+
+
+@app.patch("/api/rule-drafts/{draft_id}")
+def update_rule_draft_endpoint(draft_id: str, payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    try:
+        draft = update_rule_draft(draft_id, payload or {})
+    except ValueError as error:
+        bad_request(error)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Rule draft not found.")
+    return api_success(draft)
+
+
+@app.post("/api/rule-drafts/{draft_id}/promote")
+def promote_rule_draft_endpoint(draft_id: str) -> dict[str, Any]:
+    try:
+        result = promote_rule_draft(draft_id)
+    except ValueError as error:
+        bad_request(error)
+    if not result:
+        raise HTTPException(status_code=404, detail="Rule draft not found.")
+    return api_success(result)
 
 
 @app.get("/api/analysis/summary")

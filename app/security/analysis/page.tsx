@@ -24,17 +24,27 @@ function normalizeTimeRange(value?: string): AnalysisTimeRange {
   return analysisTimeRanges.has(value as AnalysisTimeRange) ? (value as AnalysisTimeRange) : "7d";
 }
 
+function normalizeFilter(value?: string) {
+  return value && value !== "all" ? value : undefined;
+}
+
 export default async function SecurityAnalysisPage({ searchParams }: SecurityAnalysisPageProps) {
   const params = await searchParams;
   const timeRange = normalizeTimeRange(firstParam(params, "timeRange"));
-  const query = { timeRange };
+  const filters = {
+    timeRange,
+    risk: normalizeFilter(firstParam(params, "risk")),
+    country: normalizeFilter(firstParam(params, "country")),
+    attackCategory: normalizeFilter(firstParam(params, "attackCategory")),
+    ruleId: normalizeFilter(firstParam(params, "ruleId")),
+  };
 
   const [summary, clusters, rules, sources, advice] = await Promise.all([
-    getAnalysisSummary(query),
-    getAnalysisClusters(query),
-    getAnalysisRules(query),
-    getAnalysisSources(query),
-    getAnalysisAdvice(query),
+    getAnalysisSummary(filters),
+    getAnalysisClusters(filters),
+    getAnalysisRules(filters),
+    getAnalysisSources(filters),
+    getAnalysisAdvice(filters),
   ]);
   const source = [summary, clusters, rules, sources, advice].some((result) => result.source === "api") ? "api" : "sample";
   const error = clusters.error ?? rules.error ?? sources.error ?? advice.error ?? summary.error;
@@ -49,6 +59,7 @@ export default async function SecurityAnalysisPage({ searchParams }: SecurityAna
       source={source}
       error={error}
       timeRange={timeRange}
+      filters={filters}
     />
   );
 }

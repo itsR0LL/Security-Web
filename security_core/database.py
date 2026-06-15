@@ -218,6 +218,24 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS rule_drafts (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'draft',
+        source_cluster_id TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        risk_level TEXT NOT NULL DEFAULT 'medium',
+        confidence REAL NOT NULL DEFAULT 0,
+        rationale TEXT NOT NULL DEFAULT '',
+        impact_json TEXT NOT NULL DEFAULT '{}',
+        rule_draft_json TEXT NOT NULL DEFAULT '{}',
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        manual_review_questions_json TEXT NOT NULL DEFAULT '[]',
+        promoted_rule_id TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS alerts (
         id TEXT PRIMARY KEY,
         event_id TEXT NOT NULL,
@@ -490,6 +508,25 @@ def _apply_schema_migrations(connection: sqlite3.Connection) -> None:
             "rule_json": "rule_json TEXT NOT NULL DEFAULT '{}'",
         },
     )
+    _add_missing_columns(
+        connection,
+        "rule_drafts",
+        {
+            "status": "status TEXT NOT NULL DEFAULT 'draft'",
+            "source_cluster_id": "source_cluster_id TEXT NOT NULL DEFAULT ''",
+            "title": "title TEXT NOT NULL DEFAULT ''",
+            "risk_level": "risk_level TEXT NOT NULL DEFAULT 'medium'",
+            "confidence": "confidence REAL NOT NULL DEFAULT 0",
+            "rationale": "rationale TEXT NOT NULL DEFAULT ''",
+            "impact_json": "impact_json TEXT NOT NULL DEFAULT '{}'",
+            "rule_draft_json": "rule_draft_json TEXT NOT NULL DEFAULT '{}'",
+            "evidence_json": "evidence_json TEXT NOT NULL DEFAULT '[]'",
+            "manual_review_questions_json": "manual_review_questions_json TEXT NOT NULL DEFAULT '[]'",
+            "promoted_rule_id": "promoted_rule_id TEXT NOT NULL DEFAULT ''",
+            "created_at": "created_at TEXT NOT NULL DEFAULT ''",
+            "updated_at": "updated_at TEXT NOT NULL DEFAULT ''",
+        },
+    )
 
 
 def _insert_default_rules(connection: sqlite3.Connection) -> None:
@@ -504,19 +541,7 @@ def _insert_default_rules(connection: sqlite3.Connection) -> None:
                 version, mode, attack_category, attack_subtype, tool_signature,
                 behavior_fingerprint, rule_json, created_at, updated_at
             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                rule_type = excluded.rule_type,
-                condition_json = excluded.condition_json,
-                severity = excluded.severity,
-                version = excluded.version,
-                mode = excluded.mode,
-                attack_category = excluded.attack_category,
-                attack_subtype = excluded.attack_subtype,
-                tool_signature = excluded.tool_signature,
-                behavior_fingerprint = excluded.behavior_fingerprint,
-                rule_json = excluded.rule_json,
-                updated_at = excluded.updated_at
+            ON CONFLICT(id) DO NOTHING
             """,
             (
                 rule["id"],
@@ -537,7 +562,26 @@ def _insert_default_rules(connection: sqlite3.Connection) -> None:
         )
 
 
+def _insert_default_rules_once(connection: sqlite3.Connection, *, seed_defaults: bool) -> None:
+    state_row = connection.execute(
+        "SELECT value FROM app_state WHERE key = ?",
+        ("default_rules_initialized",),
+    ).fetchone()
+    if state_row:
+        return
+
+    rule_count = connection.execute("SELECT COUNT(*) AS count FROM rules").fetchone()
+    if seed_defaults and int(rule_count["count"] if rule_count else 0) == 0:
+        _insert_default_rules(connection)
+
+    connection.execute(
+        "INSERT INTO app_state (key, value) VALUES (?, ?)",
+        ("default_rules_initialized", utc_now()),
+    )
+
+
 def init_db() -> None:
+    database_was_present = Path(DB_PATH).exists()
     ensure_data_dir()
     with db_session() as connection:
         for statement in SCHEMA_STATEMENTS:
@@ -551,5 +595,7 @@ def init_db() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_access_logs_analysis_time ON access_logs (occurred_at, country, client_ip)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_event_aggregates_analysis_country ON event_aggregates (dimension, bucket_start, dimension_value)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_sync_runs_type ON sync_runs (sync_type, id DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_rule_drafts_status ON rule_drafts (status, updated_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_rule_drafts_cluster ON rule_drafts (source_cluster_id)")
         _insert_default_state(connection)
-        _insert_default_rules(connection)
+        _insert_default_rules_once(connection, seed_defaults=not database_was_present)

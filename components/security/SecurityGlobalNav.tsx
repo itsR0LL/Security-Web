@@ -3,7 +3,7 @@
 import Link from "next/link";
 
 type SecurityNavItem = {
-  key: "home" | "situation" | "events" | "analysis";
+  key: "home" | "situation" | "events" | "analysis" | "rules";
   label: string;
   shortLabel: string;
   href: string;
@@ -18,6 +18,7 @@ const navItems: SecurityNavItem[] = [
   { key: "situation", label: "态势总览", shortLabel: "态势", href: "/security/situation" },
   { key: "events", label: "安全事件", shortLabel: "事件", href: "/security/events" },
   { key: "analysis", label: "智能分析", shortLabel: "分析", href: "/security/analysis" },
+  { key: "rules", label: "规则管理", shortLabel: "规则", href: "/security/rules" },
 ];
 
 export function SecurityGlobalNav({ active }: SecurityGlobalNavProps) {

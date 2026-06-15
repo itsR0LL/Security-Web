@@ -38,6 +38,14 @@ $env:NEXT_PUBLIC_SECURITY_API_BASE_URL="http://127.0.0.1:8787"
 - `POST /api/token/check`
 - `POST /api/settings/risk-threshold`
 - `GET /api/rules`
+- `POST /api/rules`
+- `PATCH /api/rules/{rule_id}`
+- `DELETE /api/rules/{rule_id}`
+- `GET /api/rules/cloudflare-derived`
+- `GET /api/rule-drafts`
+- `POST /api/rule-drafts/refresh`
+- `PATCH /api/rule-drafts/{draft_id}`
+- `POST /api/rule-drafts/{draft_id}/promote`
 - `POST /api/worker-logs/sync`
 
 无 Cloudflare Token 时，启动阶段会自动初始化 SQLite 并写入样例事件与聚合数据。配置 Token 后，`/api/token/check` 只执行本地结构校验，不调用 Cloudflare。

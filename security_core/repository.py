@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -17,7 +18,7 @@ from .config import (
 from .database import db_session, utc_now
 from .geo import stable_country_coordinates
 from .ip2location import lookup_ip_location
-from .rule_matcher import apply_rule_matching, normalize_rule_row
+from .rule_matcher import FIELD_OPERATORS, apply_rule_matching, build_rule_definition, normalize_rule_row
 from .sample_data import create_sample_events, create_sample_traffic_trend
 
 
@@ -44,6 +45,11 @@ HOME_RAW_SECURITY_LIMIT = 36
 HOME_RAW_COUNTRY_LIMIT = 4
 HOME_RAW_CLIENT_IP_LIMIT = 1
 SECURITY_GLOBE_ACTIONS = ("block", "challenge", "managed_challenge", "js_challenge", "log", "simulate")
+LEGACY_RULE_TYPES = {"path_keyword", "query_keyword", "user_agent_keyword", "cloudflare_action"}
+FIELD_CONDITION_RULE_TYPE = "field_conditions"
+SUPPORTED_RULE_TYPES = LEGACY_RULE_TYPES | {FIELD_CONDITION_RULE_TYPE}
+RULE_MODES = {"active", "shadow"}
+DRAFT_STATUSES = {"draft", "promoted", "ignored"}
 
 
 def _sanitize_sensitive(value: Any) -> Any:
@@ -219,6 +225,21 @@ def row_to_event(row: Any) -> dict[str, Any]:
 def _risk_rank(level: Any) -> int:
     risk_level = str(level or "info")
     return RISK_ORDER.index(risk_level) if risk_level in RISK_ORDER else RISK_ORDER.index("info")
+
+
+def _risk_from_rank(rank: Any) -> str:
+    try:
+        index = int(rank)
+    except (TypeError, ValueError):
+        return "info"
+    if 0 <= index < len(RISK_ORDER):
+        return RISK_ORDER[index]
+    return "info"
+
+
+def _risk_case_sql(column: str = "risk_level") -> str:
+    cases = " ".join(f"WHEN '{level}' THEN {index}" for index, level in enumerate(RISK_ORDER))
+    return f"CASE {column} {cases} ELSE 0 END"
 
 
 def _select_primary_rule_hit(hits: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -843,10 +864,12 @@ def clear_cloudflare_aggregates() -> None:
         connection.execute("DELETE FROM event_aggregates WHERE dimension LIKE 'cloudflare:%'")
 
 
-def replace_cloudflare_events(events: list[dict[str, Any]]) -> int:
-    with db_session() as connection:
-        connection.execute("DELETE FROM raw_events WHERE source = 'cloudflare'")
+def upsert_cloudflare_events(events: list[dict[str, Any]]) -> int:
     return insert_events(events)
+
+
+def replace_cloudflare_events(events: list[dict[str, Any]]) -> int:
+    return upsert_cloudflare_events(events)
 
 
 def replace_cloudflare_aggregates(rows: list[dict[str, Any]]) -> int:
@@ -1012,7 +1035,7 @@ def permissions_from_token_check(check: dict[str, Any] | None) -> list[dict[str,
 
 
 def _sync_mode(status: str, used_stale: bool, sample: bool = False) -> str:
-    if sample:
+    if sample or status == "sample":
         return "sample"
     if status in {"degraded", "partial"}:
         return "degraded"
@@ -1090,8 +1113,18 @@ def get_sync_status() -> dict[str, Any]:
         sample=False,
         last_success_row=worker_success_sync,
     )
+    if sample:
+        active_state = cloudflare_state
+        active_source = "sample"
+    elif has_worker_log_data():
+        active_state = worker_state
+        active_source = SYNC_TYPE_WORKER_LOG
+    else:
+        active_state = cloudflare_state
+        active_source = SYNC_TYPE_CLOUDFLARE
     return {
-        **cloudflare_state,
+        **active_state,
+        "activeSource": active_source,
         "localEventCount": event_count,
         "aggregateCount": aggregate_count,
         "refreshIntervalHours": get_int_state("refresh_interval_hours", DEFAULT_REFRESH_INTERVAL_HOURS),
@@ -1260,6 +1293,7 @@ def get_traffic_trend() -> list[dict[str, Any]]:
         bandwidth_mb = round(row["bandwidth_bytes"] / 1024 / 1024)
         cached_percent = round((row["cached_bytes"] / row["bandwidth_bytes"]) * 100) if row["bandwidth_bytes"] else 0
         origin_mb = round(row["origin_bytes"] / 1024 / 1024)
+        source = str(row["dimension"]).split(":", 1)[0]
         points.append(
             {
                 "label": bucket.strftime("%m-%d %H:00"),
@@ -1269,6 +1303,8 @@ def get_traffic_trend() -> list[dict[str, Any]]:
                 "bandwidthMb": bandwidth_mb,
                 "cachedPercent": cached_percent,
                 "originMb": origin_mb,
+                "source": source,
+                "hasMeasuredBandwidth": int(row["bandwidth_bytes"] or 0) > 0,
             }
         )
     return points
@@ -1934,16 +1970,585 @@ def update_risk_threshold(level: str) -> None:
     set_state("high_risk_threshold", level)
 
 
+def _payload_value(payload: dict[str, Any], camel_key: str, snake_key: str | None = None, default: Any = None) -> Any:
+    if camel_key in payload:
+        return payload[camel_key]
+    if snake_key and snake_key in payload:
+        return payload[snake_key]
+    return default
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required.")
+    return text
+
+
+def _optional_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise ValueError("enabled must be a boolean.")
+
+
+def _normalize_mode(value: Any) -> str:
+    mode = str(value or "active").strip()
+    if mode not in RULE_MODES:
+        raise ValueError("mode must be active or shadow.")
+    return mode
+
+
+def _normalize_severity(value: Any) -> str:
+    severity = str(value or "medium").strip()
+    if severity not in RISK_ORDER:
+        raise ValueError("severity must be one of info, low, medium, high, critical.")
+    return severity
+
+
+def _normalize_rule_type(value: Any, condition: dict[str, Any]) -> str:
+    rule_type = str(value or "").strip()
+    if not rule_type and "conditions" in condition:
+        rule_type = FIELD_CONDITION_RULE_TYPE
+    if not rule_type:
+        raise ValueError("ruleType is required.")
+    if rule_type not in SUPPORTED_RULE_TYPES:
+        raise ValueError("ruleType is not supported.")
+    return rule_type
+
+
+def _ensure_json_value(value: Any, field_name: str) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be JSON serializable.") from error
+
+
+def _has_non_empty_text(items: Any) -> bool:
+    return isinstance(items, list) and any(str(item or "").strip() for item in items)
+
+
+def _validate_condition_item(item: Any, index: int) -> None:
+    if not isinstance(item, dict):
+        raise ValueError(f"condition.conditions[{index}] must be an object.")
+    field = str(item.get("field") or "").strip()
+    operator = str(item.get("operator") or "").strip()
+    allowed_operators = FIELD_OPERATORS.get(field)
+    if not allowed_operators:
+        raise ValueError(f"condition.conditions[{index}].field is not supported.")
+    if operator not in allowed_operators:
+        raise ValueError(f"condition.conditions[{index}].operator is not supported for {field}.")
+
+    value = item.get("value")
+    if operator == "contains":
+        if isinstance(value, (dict, list)) or not str(value or "").strip():
+            raise ValueError(f"condition.conditions[{index}].value must be a non-empty text value.")
+        return
+    if operator == "equals":
+        if field == "statusCode":
+            try:
+                int(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"condition.conditions[{index}].value must be an integer status code.") from error
+        elif isinstance(value, (dict, list)) or not str(value or "").strip():
+            raise ValueError(f"condition.conditions[{index}].value must be a non-empty text value.")
+        return
+    if operator == "in":
+        if not _has_non_empty_text(value):
+            raise ValueError(f"condition.conditions[{index}].value must be a non-empty list.")
+        return
+    if operator == "range":
+        if not isinstance(value, dict):
+            raise ValueError(f"condition.conditions[{index}].value must be an object with min or max.")
+        minimum = value.get("min")
+        maximum = value.get("max")
+        if minimum is None and maximum is None:
+            raise ValueError(f"condition.conditions[{index}].value must include min or max.")
+        try:
+            minimum_number = int(minimum) if minimum is not None else None
+            maximum_number = int(maximum) if maximum is not None else None
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"condition.conditions[{index}].value min and max must be integers.") from error
+        if minimum_number is not None and maximum_number is not None and minimum_number > maximum_number:
+            raise ValueError(f"condition.conditions[{index}].value min cannot exceed max.")
+
+
+def _normalize_condition(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("condition must be an object.")
+    condition = _ensure_json_value(value, "condition")
+    if "conditions" not in condition:
+        return condition
+    conditions = condition.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        raise ValueError("condition.conditions must be a non-empty list.")
+    for index, item in enumerate(conditions):
+        _validate_condition_item(item, index)
+    return condition
+
+
+def _validate_rule_condition(rule_type: str, condition: dict[str, Any]) -> None:
+    if "conditions" in condition:
+        return
+    if rule_type in {"path_keyword", "query_keyword", "user_agent_keyword"}:
+        if not _has_non_empty_text(condition.get("keywords")):
+            raise ValueError("condition.keywords must be a non-empty list.")
+        return
+    if rule_type == "cloudflare_action":
+        if not _has_non_empty_text(condition.get("actions")):
+            raise ValueError("condition.actions must be a non-empty list.")
+        return
+    if rule_type == FIELD_CONDITION_RULE_TYPE:
+        raise ValueError("field_conditions rules require condition.conditions.")
+
+
+def _rule_payload_from_row(row: Any) -> dict[str, Any]:
+    rule = normalize_rule_row(row)
+    rule["createdAt"] = row["created_at"]
+    rule["updatedAt"] = row["updated_at"]
+    return rule
+
+
+def _rule_definition_json(record: dict[str, Any]) -> str:
+    return json.dumps(
+        build_rule_definition(
+            {
+                "id": record["id"],
+                "version": record["version"],
+                "mode": record["mode"],
+                "ruleType": record["ruleType"],
+                "condition": record["condition"],
+                "severity": record["severity"],
+                "attackCategory": record["attackCategory"],
+                "attackSubtype": record["attackSubtype"],
+                "toolSignature": record["toolSignature"],
+                "behaviorFingerprint": record["behaviorFingerprint"],
+            }
+        ),
+        ensure_ascii=False,
+    )
+
+
+def _build_rule_record(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    condition_value = _payload_value(payload, "condition", None, existing["condition"] if existing else None)
+    condition = _normalize_condition(condition_value)
+    rule_type = _normalize_rule_type(
+        _payload_value(payload, "ruleType", "rule_type", existing["ruleType"] if existing else None),
+        condition,
+    )
+    _validate_rule_condition(rule_type, condition)
+
+    enabled_value = _payload_value(payload, "enabled", None, existing["enabled"] if existing else True)
+    record = {
+        "id": existing["id"] if existing else _required_text(_payload_value(payload, "id"), "id"),
+        "name": _required_text(_payload_value(payload, "name", None, existing["name"] if existing else None), "name"),
+        "enabled": _normalize_enabled(enabled_value),
+        "ruleType": rule_type,
+        "condition": condition,
+        "severity": _normalize_severity(_payload_value(payload, "severity", None, existing["severity"] if existing else "medium")),
+        "version": _optional_text(_payload_value(payload, "version", None, existing["version"] if existing else "1.0.0")) or "1.0.0",
+        "mode": _normalize_mode(_payload_value(payload, "mode", None, existing["mode"] if existing else "active")),
+        "attackCategory": _optional_text(
+            _payload_value(payload, "attackCategory", "attack_category", existing["attackCategory"] if existing else "")
+        ),
+        "attackSubtype": _optional_text(
+            _payload_value(payload, "attackSubtype", "attack_subtype", existing["attackSubtype"] if existing else "")
+        ),
+        "toolSignature": _optional_text(
+            _payload_value(payload, "toolSignature", "tool_signature", existing["toolSignature"] if existing else "")
+        ),
+        "behaviorFingerprint": _optional_text(
+            _payload_value(
+                payload,
+                "behaviorFingerprint",
+                "behavior_fingerprint",
+                existing["behaviorFingerprint"] if existing else "",
+            )
+        ),
+    }
+    record["ruleJson"] = _rule_definition_json(record)
+    return record
+
+
+def _insert_rule_record(connection: Any, record: dict[str, Any], *, created_at: str, updated_at: str) -> None:
+    connection.execute(
+        """
+        INSERT INTO rules (
+            id, name, enabled, rule_type, condition_json, severity, version, mode,
+            attack_category, attack_subtype, tool_signature, behavior_fingerprint,
+            rule_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["id"],
+            record["name"],
+            1 if record["enabled"] else 0,
+            record["ruleType"],
+            json.dumps(record["condition"], ensure_ascii=False),
+            record["severity"],
+            record["version"],
+            record["mode"],
+            record["attackCategory"],
+            record["attackSubtype"],
+            record["toolSignature"],
+            record["behaviorFingerprint"],
+            record["ruleJson"],
+            created_at,
+            updated_at,
+        ),
+    )
+
+
+def _update_rule_record(connection: Any, record: dict[str, Any], *, updated_at: str) -> None:
+    connection.execute(
+        """
+        UPDATE rules
+        SET name = ?, enabled = ?, rule_type = ?, condition_json = ?, severity = ?,
+            version = ?, mode = ?, attack_category = ?, attack_subtype = ?,
+            tool_signature = ?, behavior_fingerprint = ?, rule_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            record["name"],
+            1 if record["enabled"] else 0,
+            record["ruleType"],
+            json.dumps(record["condition"], ensure_ascii=False),
+            record["severity"],
+            record["version"],
+            record["mode"],
+            record["attackCategory"],
+            record["attackSubtype"],
+            record["toolSignature"],
+            record["behaviorFingerprint"],
+            record["ruleJson"],
+            updated_at,
+            record["id"],
+        ),
+    )
+
+
 def get_rules() -> list[dict[str, Any]]:
     with db_session() as connection:
         rows = connection.execute("SELECT * FROM rules ORDER BY id ASC").fetchall()
-    rules = []
-    for row in rows:
-        rule = normalize_rule_row(row)
-        rule["createdAt"] = row["created_at"]
-        rule["updatedAt"] = row["updated_at"]
-        rules.append(rule)
-    return rules
+    return [_rule_payload_from_row(row) for row in rows]
+
+
+def get_rule(rule_id: str) -> dict[str, Any] | None:
+    with db_session() as connection:
+        row = connection.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    return _rule_payload_from_row(row) if row else None
+
+
+def _new_rule_id(connection: Any) -> str:
+    while True:
+        rule_id = f"local-rule-{uuid.uuid4().hex}"
+        row = connection.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        if not row:
+            return rule_id
+
+
+def create_rule(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Rule payload must be an object.")
+    with db_session() as connection:
+        rule_payload = dict(payload)
+        if not str(rule_payload.get("id") or "").strip():
+            rule_payload["id"] = _new_rule_id(connection)
+        rule_id = _required_text(rule_payload.get("id"), "id")
+        if connection.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone():
+            raise ValueError("Rule id already exists.")
+        record = _build_rule_record(rule_payload)
+        now = utc_now()
+        _insert_rule_record(connection, record, created_at=now, updated_at=now)
+        row = connection.execute("SELECT * FROM rules WHERE id = ?", (record["id"],)).fetchone()
+    return _rule_payload_from_row(row)
+
+
+def update_rule(rule_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        raise ValueError("Rule payload must be an object.")
+    with db_session() as connection:
+        row = connection.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        if not row:
+            return None
+        existing = _rule_payload_from_row(row)
+        record = _build_rule_record(payload, existing)
+        updated_at = utc_now()
+        _update_rule_record(connection, record, updated_at=updated_at)
+        updated_row = connection.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    return _rule_payload_from_row(updated_row)
+
+
+def delete_rule(rule_id: str) -> bool:
+    with db_session() as connection:
+        cursor = connection.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+    return cursor.rowcount > 0
+
+
+def _draft_payload_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "sourceClusterId": row["source_cluster_id"],
+        "title": row["title"],
+        "riskLevel": row["risk_level"],
+        "confidence": row["confidence"],
+        "rationale": row["rationale"],
+        "impact": _json_loads(row["impact_json"], {}),
+        "ruleDraft": _json_loads(row["rule_draft_json"], {}),
+        "evidence": _json_loads(row["evidence_json"], []),
+        "manualReviewQuestions": _json_loads(row["manual_review_questions_json"], []),
+        "promotedRuleId": row["promoted_rule_id"] or None,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def _normalize_draft_status(value: Any) -> str:
+    status = str(value or "").strip()
+    if status not in DRAFT_STATUSES:
+        raise ValueError("status must be draft, promoted, or ignored.")
+    return status
+
+
+def list_rule_drafts(status: str | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where_sql = ""
+    if status is not None:
+        normalized_status = _normalize_draft_status(status)
+        where_sql = "WHERE status = ?"
+        params.append(normalized_status)
+    with db_session() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM rule_drafts {where_sql} ORDER BY updated_at DESC, id ASC",
+            params,
+        ).fetchall()
+    return [_draft_payload_from_row(row) for row in rows]
+
+
+def upsert_rule_drafts(drafts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = utc_now()
+    with db_session() as connection:
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                raise ValueError("Rule draft item must be an object.")
+            draft_id = _required_text(draft.get("id"), "id")
+            status = _normalize_draft_status(draft.get("status") or "draft")
+            connection.execute(
+                """
+                INSERT INTO rule_drafts (
+                    id, status, source_cluster_id, title, risk_level, confidence,
+                    rationale, impact_json, rule_draft_json, evidence_json,
+                    manual_review_questions_json, promoted_rule_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = CASE
+                        WHEN rule_drafts.status = 'draft' THEN excluded.status
+                        ELSE rule_drafts.status
+                    END,
+                    source_cluster_id = excluded.source_cluster_id,
+                    title = excluded.title,
+                    risk_level = excluded.risk_level,
+                    confidence = excluded.confidence,
+                    rationale = excluded.rationale,
+                    impact_json = excluded.impact_json,
+                    rule_draft_json = excluded.rule_draft_json,
+                    evidence_json = excluded.evidence_json,
+                    manual_review_questions_json = excluded.manual_review_questions_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    draft_id,
+                    status,
+                    _optional_text(draft.get("sourceClusterId")),
+                    _optional_text(draft.get("title")),
+                    _normalize_severity(draft.get("riskLevel") or "medium"),
+                    float(draft.get("confidence") or 0),
+                    _optional_text(draft.get("rationale")),
+                    json.dumps(_ensure_json_value(draft.get("impact") or {}, "impact"), ensure_ascii=False),
+                    json.dumps(_ensure_json_value(draft.get("ruleDraft") or {}, "ruleDraft"), ensure_ascii=False),
+                    json.dumps(_ensure_json_value(draft.get("evidence") or [], "evidence"), ensure_ascii=False),
+                    json.dumps(
+                        _ensure_json_value(draft.get("manualReviewQuestions") or [], "manualReviewQuestions"),
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    now,
+                ),
+            )
+        rows = connection.execute("SELECT * FROM rule_drafts ORDER BY updated_at DESC, id ASC").fetchall()
+    return [_draft_payload_from_row(row) for row in rows]
+
+
+def update_rule_draft(draft_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        raise ValueError("Rule draft payload must be an object.")
+    if "status" not in payload:
+        raise ValueError("status is required.")
+    status = _normalize_draft_status(payload.get("status"))
+    if status == "promoted":
+        raise ValueError("Use the promote endpoint to promote drafts.")
+    with db_session() as connection:
+        row = connection.execute("SELECT * FROM rule_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        connection.execute(
+            "UPDATE rule_drafts SET status = ?, updated_at = ? WHERE id = ?",
+            (status, utc_now(), draft_id),
+        )
+        updated_row = connection.execute("SELECT * FROM rule_drafts WHERE id = ?", (draft_id,)).fetchone()
+    return _draft_payload_from_row(updated_row)
+
+
+def _promoted_rule_id(draft_id: str) -> str:
+    return f"rule-{draft_id.removeprefix('draft-')}"
+
+
+def promote_rule_draft(draft_id: str) -> dict[str, Any] | None:
+    with db_session() as connection:
+        row = connection.execute("SELECT * FROM rule_drafts WHERE id = ?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        if row["status"] == "ignored":
+            raise ValueError("Ignored draft cannot be promoted.")
+        if row["status"] == "promoted":
+            promoted_rule_id = row["promoted_rule_id"]
+            if promoted_rule_id:
+                rule_row = connection.execute("SELECT * FROM rules WHERE id = ?", (promoted_rule_id,)).fetchone()
+                if rule_row:
+                    return {"draft": _draft_payload_from_row(row), "rule": _rule_payload_from_row(rule_row)}
+            raise ValueError("Draft is already promoted.")
+
+        draft = _draft_payload_from_row(row)
+        rule_draft = draft["ruleDraft"]
+        if not isinstance(rule_draft, dict):
+            raise ValueError("Draft rule payload is invalid.")
+        classification = rule_draft.get("classification")
+        if not isinstance(classification, dict):
+            classification = {}
+        rule_id = _promoted_rule_id(draft_id)
+        if connection.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone():
+            raise ValueError("Promoted rule id already exists.")
+        record = _build_rule_record(
+            {
+                "id": rule_id,
+                "name": rule_draft.get("name") or draft["title"],
+                "enabled": False,
+                "mode": "shadow",
+                "ruleType": rule_draft.get("ruleType"),
+                "condition": rule_draft.get("condition"),
+                "severity": rule_draft.get("severity") or draft["riskLevel"],
+                "version": "1.0.0",
+                "attackCategory": classification.get("attackCategory"),
+                "attackSubtype": classification.get("attackSubtype"),
+                "toolSignature": classification.get("toolSignature"),
+                "behaviorFingerprint": classification.get("behaviorFingerprint"),
+            }
+        )
+        now = utc_now()
+        _insert_rule_record(connection, record, created_at=now, updated_at=now)
+        connection.execute(
+            "UPDATE rule_drafts SET status = 'promoted', promoted_rule_id = ?, updated_at = ? WHERE id = ?",
+            (rule_id, now, draft_id),
+        )
+        updated_draft_row = connection.execute("SELECT * FROM rule_drafts WHERE id = ?", (draft_id,)).fetchone()
+        rule_row = connection.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    return {"draft": _draft_payload_from_row(updated_draft_row), "rule": _rule_payload_from_row(rule_row)}
+
+
+def _cloudflare_action_values(rule: dict[str, Any]) -> list[str]:
+    condition = rule.get("condition")
+    if not isinstance(condition, dict):
+        return []
+    values: list[str] = []
+    actions = condition.get("actions")
+    if isinstance(actions, list):
+        values.extend(str(action).strip().lower() for action in actions if str(action or "").strip())
+    conditions = condition.get("conditions")
+    if isinstance(conditions, list):
+        for item in conditions:
+            if not isinstance(item, dict) or item.get("field") != "action":
+                continue
+            operator = item.get("operator")
+            value = item.get("value")
+            if operator == "equals" and str(value or "").strip():
+                values.append(str(value).strip().lower())
+            elif operator == "in" and isinstance(value, list):
+                values.extend(str(action).strip().lower() for action in value if str(action or "").strip())
+    return list(dict.fromkeys(values))
+
+
+def get_cloudflare_derived_rules() -> dict[str, Any]:
+    base_rule = get_rule("builtin-cloudflare-action")
+    if not base_rule:
+        return {
+            "generatedAt": utc_now(),
+            "source": "raw_events",
+            "baseRuleId": "builtin-cloudflare-action",
+            "baseRule": None,
+            "totalRules": 0,
+            "items": [],
+        }
+    actions = _cloudflare_action_values(base_rule)
+    if not actions:
+        return {
+            "generatedAt": utc_now(),
+            "source": "raw_events",
+            "baseRuleId": "builtin-cloudflare-action",
+            "baseRule": base_rule,
+            "totalRules": 0,
+            "items": [],
+        }
+    placeholders = ",".join("?" for _ in actions)
+    with db_session() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                action,
+                COUNT(*) AS event_count,
+                MIN(occurred_at) AS first_seen,
+                MAX(occurred_at) AS last_seen,
+                MAX({_risk_case_sql()}) AS max_risk_rank
+            FROM raw_events
+            WHERE source = 'cloudflare'
+              AND action IN ({placeholders})
+            GROUP BY action
+            ORDER BY event_count DESC, action ASC
+            """,
+            actions,
+        ).fetchall()
+    items = [
+        {
+            "id": f"cloudflare-derived-{row['action']}",
+            "name": f"Cloudflare {row['action']}",
+            "readOnly": True,
+            "source": "raw_events",
+            "baseRuleId": "builtin-cloudflare-action",
+            "enabled": base_rule["enabled"],
+            "mode": base_rule["mode"],
+            "ruleType": "cloudflare_action",
+            "condition": {"actions": [row["action"]]},
+            "severity": base_rule["severity"],
+            "riskLevel": _risk_from_rank(row["max_risk_rank"]),
+            "eventCount": int(row["event_count"]),
+            "firstSeen": row["first_seen"],
+            "lastSeen": row["last_seen"],
+        }
+        for row in rows
+    ]
+    return {
+        "generatedAt": utc_now(),
+        "source": "raw_events",
+        "baseRuleId": "builtin-cloudflare-action",
+        "baseRule": base_rule,
+        "totalRules": len(items),
+        "items": items,
+    }
 
 
 def source_summary() -> dict[str, Any]:

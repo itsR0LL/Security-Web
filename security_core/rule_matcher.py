@@ -13,6 +13,26 @@ MATCH_FIELD_BY_RULE_TYPE = {
     "cloudflare_action": "action",
 }
 
+FIELD_OPERATORS = {
+    "path": {"contains", "equals", "in"},
+    "query": {"contains", "equals", "in"},
+    "userAgent": {"contains", "equals", "in"},
+    "action": {"equals", "in"},
+    "method": {"equals", "in"},
+    "statusCode": {"equals", "range"},
+    "clientIp": {"equals", "in"},
+    "country": {"equals", "in"},
+    "region": {"equals", "in"},
+    "city": {"equals", "in"},
+    "asn": {"equals", "in"},
+}
+
+EVENT_FIELD_FALLBACKS = {
+    "userAgent": "user_agent",
+    "clientIp": "client_ip",
+    "statusCode": "status_code",
+}
+
 
 def json_loads(value: str | None, fallback: Any) -> Any:
     if not value:
@@ -83,8 +103,10 @@ def build_rule_definition(rule: dict[str, Any]) -> dict[str, Any]:
 
 def field_text(event: dict[str, Any], field: str) -> str:
     value = event.get(field)
-    if value is None and field == "userAgent":
-        value = event.get("user_agent")
+    if value is None:
+        fallback_field = EVENT_FIELD_FALLBACKS.get(field)
+        if fallback_field:
+            value = event.get(fallback_field)
     return str(value or "")
 
 
@@ -108,11 +130,122 @@ def action_hit(rule: dict[str, Any], event: dict[str, Any]) -> dict[str, str] | 
     return None
 
 
+def rule_conditions(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    condition = rule.get("condition")
+    if not isinstance(condition, dict):
+        return []
+    conditions = condition.get("conditions")
+    if not isinstance(conditions, list):
+        return []
+    return [item for item in conditions if isinstance(item, dict)]
+
+
+def condition_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def equals_condition(event_value: Any, expected: Any, *, numeric: bool = False) -> bool:
+    if numeric:
+        try:
+            return int(event_value) == int(expected)
+        except (TypeError, ValueError):
+            return False
+    return condition_value_text(event_value).lower() == condition_value_text(expected).lower()
+
+
+def in_condition(event_value: Any, expected_values: Any) -> tuple[bool, str]:
+    if not isinstance(expected_values, list):
+        return False, ""
+    event_text = condition_value_text(event_value).lower()
+    for expected in expected_values:
+        expected_text = condition_value_text(expected)
+        if event_text == expected_text.lower():
+            return True, expected_text
+    return False, ""
+
+
+def range_condition(event_value: Any, range_value: Any) -> bool:
+    if not isinstance(range_value, dict):
+        return False
+    try:
+        number = int(event_value)
+    except (TypeError, ValueError):
+        return False
+    minimum = range_value.get("min")
+    maximum = range_value.get("max")
+    if minimum is None and maximum is None:
+        return False
+    try:
+        if minimum is not None and number < int(minimum):
+            return False
+        if maximum is not None and number > int(maximum):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def evaluate_condition(condition: dict[str, Any], event: dict[str, Any]) -> dict[str, str] | None:
+    field = str(condition.get("field") or "")
+    operator = str(condition.get("operator") or "")
+    if operator not in FIELD_OPERATORS.get(field, set()):
+        return None
+
+    event_value = event.get(field)
+    if event_value is None:
+        fallback_field = EVENT_FIELD_FALLBACKS.get(field)
+        if fallback_field:
+            event_value = event.get(fallback_field)
+
+    expected = condition.get("value")
+    if operator == "contains":
+        expected_text = condition_value_text(expected)
+        if expected_text and expected_text.lower() in condition_value_text(event_value).lower():
+            return {"matchedField": field, "matchedValue": expected_text}
+        return None
+    if operator == "equals":
+        numeric = field == "statusCode"
+        if equals_condition(event_value, expected, numeric=numeric):
+            return {"matchedField": field, "matchedValue": condition_value_text(expected)}
+        return None
+    if operator == "in":
+        matched, matched_value = in_condition(event_value, expected)
+        if matched:
+            return {"matchedField": field, "matchedValue": matched_value}
+        return None
+    if operator == "range":
+        if range_condition(event_value, expected):
+            return {"matchedField": field, "matchedValue": json.dumps(expected, ensure_ascii=False, sort_keys=True)}
+        return None
+    return None
+
+
+def conditions_hit(rule: dict[str, Any], event: dict[str, Any]) -> dict[str, str] | None:
+    conditions = rule_conditions(rule)
+    if not conditions:
+        return None
+    hits = []
+    for condition in conditions:
+        hit = evaluate_condition(condition, event)
+        if not hit:
+            return None
+        hits.append(hit)
+    return {
+        "matchedField": ",".join(hit["matchedField"] for hit in hits),
+        "matchedValue": json.dumps([hit["matchedValue"] for hit in hits], ensure_ascii=False),
+    }
+
+
 def match_rule(rule: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
     if not rule["enabled"]:
         return None
     rule_type = rule["ruleType"]
-    if rule_type == "cloudflare_action":
+    condition_hit = conditions_hit(rule, event)
+    if condition_hit:
+        hit = condition_hit
+    elif rule_type == "cloudflare_action":
         hit = action_hit(rule, event)
     else:
         field = MATCH_FIELD_BY_RULE_TYPE.get(rule_type)

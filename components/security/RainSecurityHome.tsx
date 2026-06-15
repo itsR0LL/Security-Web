@@ -56,13 +56,14 @@ const railNavItems = [
     hud: ["CLUSTER", "SOURCE HABIT", "RULE TREND", "EVIDENCE", "DRAFT RULE", "OPEN ANALYSIS"],
   },
   {
-    label: "PASS",
-    cn: "预留",
+    href: "/security/rules",
+    label: "RULES",
+    cn: "规则",
     effect: "tower",
-    code: "PASS-04",
-    desc: "后续功能预留",
-    meta: "reserved extension slot",
-    hud: ["RESERVED", "NO ROUTE", "WAITING", "FUTURE MODULE", "KEEP SLOT", "PASS"],
+    code: "RULE-044",
+    desc: "本地规则、智能草稿与 Cloudflare 派生层",
+    meta: "rule management bay",
+    hud: ["LOCAL RULES", "SHADOW MODE", "DRAFT QUEUE", "CF READONLY", "CONDITION EDIT", "OPEN RULES"],
   },
   {
     label: "PASS",
@@ -96,16 +97,43 @@ function formatTime(value: string) {
   }).format(date);
 }
 
+function resolveHomeModeLabel(overview: SecurityOverview, source: "api" | "sample", error?: string) {
+  if (error) return "DEGRADED";
+  if (source !== "api") return "SAMPLE SIM";
+  if (overview.sync.activeSource === "worker_log") return "LOG REPLAY";
+  if (overview.sync.activeSource === "cloudflare") return syncStatusLabel[overview.sync.status] ?? "CLOUDFLARE";
+  if (overview.sync.activeSource === "sample") return "SAMPLE SIM";
+  if (!overview.sampleMode && overview.sync.workerLog?.status === "success") return "LOG REPLAY";
+  return syncStatusLabel[overview.sync.status] ?? "LIVE DATA";
+}
+
+function formatRequests(value: number | undefined) {
+  return (value ?? 0).toLocaleString("zh-CN");
+}
+
 export function RainSecurityHome({ overview, source, error }: RainSecurityHomeProps) {
   const { cursorRef } = useRainCursor();
   const [routeHover, setRouteHover] = useState<GlobeRouteHover | null>(null);
   const latestTraffic = overview.trafficTrend.at(-1);
   const highEvents = overview.recentEvents.filter((event) => event.riskLevel === "high" || event.riskLevel === "critical");
-  const modeLabel = error ? "降级展示" : source === "api" ? syncStatusLabel[overview.sync.status] : "样例仿真";
+  const modeLabel = resolveHomeModeLabel(overview, source, error);
   const totalBandwidth = useMemo(
     () => overview.trafficTrend.reduce((total, point) => total + point.bandwidthMb, 0),
     [overview.trafficTrend],
   );
+  const totalRequests = useMemo(
+    () => overview.trafficTrend.reduce((total, point) => total + point.requests, 0),
+    [overview.trafficTrend],
+  );
+  const hasMeasuredBandwidth = useMemo(
+    () => overview.trafficTrend.some((point) => point.hasMeasuredBandwidth ?? point.bandwidthMb > 0),
+    [overview.trafficTrend],
+  );
+  const latestThroughput = hasMeasuredBandwidth ? `${latestTraffic?.bandwidthMb ?? 0}MB` : `${formatRequests(latestTraffic?.requests)} req/h`;
+  const throughputWindow = hasMeasuredBandwidth
+    ? `${totalBandwidth.toLocaleString("zh-CN")}MB 展示窗口`
+    : `${totalRequests.toLocaleString("zh-CN")} requests / live window`;
+  const flowSource = hasMeasuredBandwidth ? `源站 ${latestTraffic?.originMb ?? 0}MB` : overview.sync.activeSource === "worker_log" ? "Worker/D1 live log" : "Live request log";
   const blockedOrChallenged = overview.recentEvents.filter((event) =>
     ["block", "challenge", "managed_challenge"].includes(event.action),
   ).length;
@@ -234,16 +262,16 @@ export function RainSecurityHome({ overview, source, error }: RainSecurityHomePr
             <strong>{latestTraffic?.requests.toLocaleString("zh-CN") ?? "0"}</strong>
             <span>{latestTraffic?.cachedPercent ?? 0}% 缓存命中</span>
             <p>吞吐量</p>
-            <strong>{latestTraffic?.bandwidthMb ?? 0}MB</strong>
-            <span>{totalBandwidth.toLocaleString("zh-CN")}MB 展示窗口</span>
+            <strong>{latestThroughput}</strong>
+            <span>{throughputWindow}</span>
             <p>处置 / 航线</p>
             <strong>{blockedOrChallenged}/{sourceLocations}</strong>
             <span>{highEvents.length} 条高风险</span>
           </div>
           <div className="rain-home-flow-strip">
             <span>流量吞吐</span>
-            <strong>{latestTraffic?.bandwidthMb ?? 0}MB</strong>
-            <span>源站 {latestTraffic?.originMb ?? 0}MB</span>
+            <strong>{latestThroughput}</strong>
+            <span>{flowSource}</span>
           </div>
           <div className="rain-home-frame-bottom">
             <div className="rain-home-env">

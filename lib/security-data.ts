@@ -88,6 +88,8 @@ export type TrendPoint = {
   bandwidthMb: number;
   cachedPercent: number;
   originMb: number;
+  source?: SyncRunSource | "sample";
+  hasMeasuredBandwidth?: boolean;
 };
 
 export type DistributionPoint = {
@@ -140,6 +142,7 @@ export type SyncRunSource = "cloudflare" | "worker_log";
 export type SyncStatus = {
   status: SyncStatusValue;
   mode?: SecurityDataMode;
+  activeSource?: SyncRunSource | "sample";
   cloudflareLive?: boolean;
   lastSyncAt: string;
   lastSuccessAt: string;
@@ -439,6 +442,82 @@ export type AnalysisAdviceResult = {
   filters: AnalysisFiltersPayload;
   totalDrafts: number;
   items: AnalysisAdvice[];
+};
+
+export type RuleConditionField =
+  | "path"
+  | "query"
+  | "userAgent"
+  | "action"
+  | "method"
+  | "statusCode"
+  | "clientIp"
+  | "country"
+  | "region"
+  | "city"
+  | "asn";
+
+export type RuleConditionOperator = "contains" | "equals" | "in" | "range";
+
+export type SecurityRuleMode = "active" | "shadow";
+
+export type SecurityRuleConditionClause = {
+  field: RuleConditionField;
+  operator: RuleConditionOperator;
+  value: string | string[] | { min?: string | number; max?: string | number };
+};
+
+export type SecurityRuleConditionDocument = {
+  conditions?: SecurityRuleConditionClause[];
+  [key: string]: unknown;
+};
+
+export type ManagedSecurityRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  ruleType: string;
+  condition: SecurityRuleConditionDocument;
+  severity: RiskLevel | string;
+  version: string;
+  mode: SecurityRuleMode | string;
+  attackCategory: string;
+  attackSubtype: string;
+  toolSignature: string;
+  behaviorFingerprint: string;
+  definition?: AnalysisRuleDefinition;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type SecurityRuleMutation = Omit<ManagedSecurityRule, "createdAt" | "updatedAt" | "definition">;
+
+export type SecurityRuleDraft = AnalysisAdvice & {
+  createdAt?: string;
+  updatedAt?: string;
+  promotedRuleId?: string;
+};
+
+export type SecurityRuleDraftUpdate = {
+  status?: string;
+};
+
+export type CloudflareDerivedRule = ManagedSecurityRule & {
+  source?: string;
+  readonly?: boolean;
+  readOnly?: boolean;
+  baseRuleId?: string;
+  description?: string;
+  eventCount?: number;
+  firstSeen?: string;
+  lastSeen?: string;
+  riskLevel?: RiskLevel | string;
+};
+
+export type SecurityRulesPreviewData = {
+  rules: ManagedSecurityRule[];
+  drafts: SecurityRuleDraft[];
+  cloudflareDerived: CloudflareDerivedRule[];
 };
 
 export const riskLabels: Record<RiskLevel, string> = {
@@ -1536,5 +1615,174 @@ export function createAnalysisAdvice(clusters: AnalysisClustersResult = createAn
     filters: defaultAnalysisFilters(),
     totalDrafts: items.length,
     items,
+  };
+}
+
+function createRuleConditionDocument(
+  field: RuleConditionField,
+  operator: RuleConditionOperator,
+  value: string,
+  valueTo?: string,
+): SecurityRuleConditionDocument {
+  const normalizedValue =
+    operator === "in"
+      ? value
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : operator === "range"
+        ? {
+            ...(value ? { min: value } : {}),
+            ...(valueTo ? { max: valueTo } : {}),
+          }
+        : value;
+  return {
+    conditions: [
+      {
+        field,
+        operator,
+        value: normalizedValue,
+      },
+    ],
+  };
+}
+
+function createRuleDefinition(rule: ManagedSecurityRule): AnalysisRuleDefinition {
+  return {
+    id: rule.id,
+    version: rule.version,
+    mode: rule.mode,
+    ruleType: rule.ruleType,
+    condition: rule.condition,
+    severity: rule.severity,
+    classification: {
+      attackCategory: rule.attackCategory,
+      attackSubtype: rule.attackSubtype,
+      toolSignature: rule.toolSignature,
+      behaviorFingerprint: rule.behaviorFingerprint,
+    },
+  };
+}
+
+export function createSampleRuleManagementData(now = new Date()): SecurityRulesPreviewData {
+  const generatedAt = now.toISOString();
+  const sampleRules: ManagedSecurityRule[] = [
+    {
+      id: "builtin-sensitive-path",
+      name: "Sensitive path probe",
+      enabled: true,
+      ruleType: "path_keyword",
+      condition: createRuleConditionDocument("path", "in", ".env, .env.local, wp-login.php, phpmyadmin, /admin"),
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "reconnaissance",
+      attackSubtype: "sensitive_path_probe",
+      toolSignature: "scanner_path_probe",
+      behaviorFingerprint: "http_path_keyword_probe",
+      createdAt: generatedAt,
+      updatedAt: generatedAt,
+    },
+    {
+      id: "builtin-sqli",
+      name: "SQL injection probe",
+      enabled: true,
+      ruleType: "query_keyword",
+      condition: createRuleConditionDocument("query", "in", " OR 1=1, UNION SELECT, --"),
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "injection",
+      attackSubtype: "sql_injection_probe",
+      toolSignature: "manual_or_scanner_sqli",
+      behaviorFingerprint: "http_query_sqli_keyword",
+      createdAt: generatedAt,
+      updatedAt: generatedAt,
+    },
+    {
+      id: "builtin-xss",
+      name: "XSS probe",
+      enabled: true,
+      ruleType: "query_keyword",
+      condition: createRuleConditionDocument("query", "in", "<script, javascript:, onerror="),
+      severity: "medium",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "injection",
+      attackSubtype: "xss_probe",
+      toolSignature: "manual_or_scanner_xss",
+      behaviorFingerprint: "http_query_xss_keyword",
+      createdAt: generatedAt,
+      updatedAt: generatedAt,
+    },
+    {
+      id: "builtin-scanner-ua",
+      name: "Scanner User-Agent",
+      enabled: true,
+      ruleType: "user_agent_keyword",
+      condition: createRuleConditionDocument("userAgent", "in", "curl, zgrab, python-requests, Go-http-client"),
+      severity: "medium",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "reconnaissance",
+      attackSubtype: "scanner_user_agent",
+      toolSignature: "scanner_user_agent",
+      behaviorFingerprint: "http_user_agent_keyword",
+      createdAt: generatedAt,
+      updatedAt: generatedAt,
+    },
+    {
+      id: "builtin-cloudflare-action",
+      name: "Cloudflare security action",
+      enabled: true,
+      ruleType: "cloudflare_action",
+      condition: createRuleConditionDocument("action", "in", "block, challenge, managed_challenge"),
+      severity: "high",
+      version: "2026.06.02",
+      mode: "active",
+      attackCategory: "edge_security",
+      attackSubtype: "cloudflare_action",
+      toolSignature: "cloudflare_firewall",
+      behaviorFingerprint: "cloudflare_action_match",
+      createdAt: generatedAt,
+      updatedAt: generatedAt,
+    },
+  ].map((rule) => ({ ...rule, definition: createRuleDefinition(rule) }));
+
+  const clusters = createAnalysisClusters(createSampleSecurityData(now).events);
+  const drafts = createAnalysisAdvice(clusters).items.map((item) => ({
+    ...item,
+    createdAt: generatedAt,
+    updatedAt: generatedAt,
+  }));
+  const cloudflareDerived: CloudflareDerivedRule[] = [
+    {
+      ...sampleRules[4],
+      id: "cf-derived-managed-challenge",
+      name: "Cloudflare managed challenge layer",
+      readonly: true,
+      source: "cloudflare",
+      description: "Read-only rule layer derived from Cloudflare security actions.",
+      eventCount: 12,
+      lastSeen: generatedAt,
+      condition: createRuleConditionDocument("action", "equals", "managed_challenge"),
+    },
+    {
+      ...sampleRules[0],
+      id: "cf-derived-sensitive-paths",
+      name: "Cloudflare sensitive path signals",
+      readonly: true,
+      source: "cloudflare",
+      description: "Read-only path intelligence mirrored from Cloudflare events.",
+      eventCount: 8,
+      lastSeen: generatedAt,
+      condition: createRuleConditionDocument("path", "contains", "/admin"),
+    },
+  ];
+
+  return {
+    rules: sampleRules,
+    drafts,
+    cloudflareDerived,
   };
 }
