@@ -16,6 +16,7 @@ from .config import (
 )
 from .database import db_session, utc_now
 from .geo import stable_country_coordinates
+from .ip2location import lookup_ip_location
 from .rule_matcher import apply_rule_matching, normalize_rule_row
 from .sample_data import create_sample_events, create_sample_traffic_trend
 
@@ -360,7 +361,25 @@ def insert_access_logs(logs: list[dict[str, Any]]) -> int:
             ON CONFLICT(id) DO UPDATE SET
                 source_cursor = excluded.source_cursor,
                 received_at = excluded.received_at,
+                occurred_at = excluded.occurred_at,
+                client_ip = excluded.client_ip,
+                ip_hash = excluded.ip_hash,
+                country = excluded.country,
+                region = excluded.region,
+                city = excluded.city,
+                colo = excluded.colo,
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
+                location_precision = excluded.location_precision,
+                method = excluded.method,
+                host = excluded.host,
+                path = excluded.path,
+                query = excluded.query,
                 status_code = excluded.status_code,
+                user_agent = excluded.user_agent,
+                referer = excluded.referer,
+                cf_ray = excluded.cf_ray,
+                request_id = excluded.request_id,
                 response_bytes = excluded.response_bytes,
                 raw_json = excluded.raw_json
             """,
@@ -417,53 +436,61 @@ def _worker_aggregate_rows(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(aggregates.values())
 
 
-def upsert_worker_log_aggregates(rows: list[dict[str, Any]]) -> int:
-    if not rows:
+def _insert_worker_log_aggregate_rows(connection: Any, rows: list[dict[str, Any]]) -> int:
+    filtered_rows = [row for row in rows if str(row.get("dimension") or "").startswith("worker_log:")]
+    if not filtered_rows:
         return 0
     created_at = utc_now()
+    connection.executemany(
+        """
+        INSERT INTO event_aggregates (
+            id, bucket_type, bucket_start, dimension, dimension_value,
+            total_count, threat_count, blocked_count, challenge_count,
+            bandwidth_bytes, cached_bytes, origin_bytes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            total_count = total_count + excluded.total_count,
+            threat_count = threat_count + excluded.threat_count,
+            blocked_count = blocked_count + excluded.blocked_count,
+            challenge_count = challenge_count + excluded.challenge_count,
+            bandwidth_bytes = bandwidth_bytes + excluded.bandwidth_bytes,
+            cached_bytes = cached_bytes + excluded.cached_bytes,
+            origin_bytes = origin_bytes + excluded.origin_bytes,
+            created_at = excluded.created_at
+        """,
+        [
+            (
+                row["id"],
+                row.get("bucket_type", "hour"),
+                row.get("bucket_start", utc_now()),
+                row["dimension"],
+                row.get("dimension_value", "all"),
+                int(row.get("total_count") or 0),
+                int(row.get("threat_count") or 0),
+                int(row.get("blocked_count") or 0),
+                int(row.get("challenge_count") or 0),
+                int(row.get("bandwidth_bytes") or 0),
+                int(row.get("cached_bytes") or 0),
+                int(row.get("origin_bytes") or 0),
+                created_at,
+            )
+            for row in filtered_rows
+        ],
+    )
+    return len(filtered_rows)
+
+
+def upsert_worker_log_aggregates(rows: list[dict[str, Any]]) -> int:
     with db_session() as connection:
-        connection.executemany(
-            """
-            INSERT INTO event_aggregates (
-                id, bucket_type, bucket_start, dimension, dimension_value,
-                total_count, threat_count, blocked_count, challenge_count,
-                bandwidth_bytes, cached_bytes, origin_bytes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                total_count = total_count + excluded.total_count,
-                threat_count = threat_count + excluded.threat_count,
-                blocked_count = blocked_count + excluded.blocked_count,
-                challenge_count = challenge_count + excluded.challenge_count,
-                bandwidth_bytes = bandwidth_bytes + excluded.bandwidth_bytes,
-                cached_bytes = cached_bytes + excluded.cached_bytes,
-                origin_bytes = origin_bytes + excluded.origin_bytes,
-                created_at = excluded.created_at
-            """,
-            [
-                (
-                    row["id"],
-                    row.get("bucket_type", "hour"),
-                    row.get("bucket_start", utc_now()),
-                    row["dimension"],
-                    row.get("dimension_value", "all"),
-                    int(row.get("total_count") or 0),
-                    int(row.get("threat_count") or 0),
-                    int(row.get("blocked_count") or 0),
-                    int(row.get("challenge_count") or 0),
-                    int(row.get("bandwidth_bytes") or 0),
-                    int(row.get("cached_bytes") or 0),
-                    int(row.get("origin_bytes") or 0),
-                    created_at,
-                )
-                for row in rows
-                if str(row.get("dimension") or "").startswith("worker_log:")
-            ],
-        )
-    return len([row for row in rows if str(row.get("dimension") or "").startswith("worker_log:")])
+        return _insert_worker_log_aggregate_rows(connection, rows)
 
 
 def insert_worker_logs(export_rows: list[dict[str, Any]]) -> dict[str, int]:
-    logs = [normalize_worker_access_log(row) for row in export_rows]
+    with db_session() as connection:
+        logs = [
+            normalize_worker_access_log(row, ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection))
+            for row in export_rows
+        ]
     if not logs:
         return {"accessLogs": 0, "events": 0, "aggregates": 0}
     access_log_count = insert_access_logs(logs)
@@ -481,6 +508,258 @@ def insert_worker_logs(export_rows: list[dict[str, Any]]) -> dict[str, int]:
             events.append(matched_event)
     event_count = insert_events(events)
     return {"accessLogs": access_log_count, "events": event_count, "aggregates": aggregate_count}
+
+
+def _merge_worker_event_raw(existing_raw_json: str | None, log: dict[str, Any]) -> str:
+    existing_raw = _json_loads(existing_raw_json, {})
+    if not isinstance(existing_raw, dict):
+        existing_raw = {}
+    merged_raw = {
+        **existing_raw,
+        **(log.get("raw") or {}),
+        "query": log.get("query"),
+    }
+    return json.dumps(merged_raw, ensure_ascii=False)
+
+
+def preview_worker_log_geo_backfill() -> dict[str, int]:
+    with db_session() as connection:
+        rows = connection.execute("SELECT * FROM access_logs WHERE source = ?", (SYNC_TYPE_WORKER_LOG,)).fetchall()
+        event_rows = {
+            str(row["id"]): row
+            for row in connection.execute(
+                "SELECT id, country, region, city, latitude, longitude, location_precision FROM raw_events WHERE source = ?",
+                (SYNC_TYPE_WORKER_LOG,),
+            ).fetchall()
+        }
+        logs = [
+            normalize_worker_access_log(dict(row), ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection))
+            for row in rows
+        ]
+
+    access_changes = 0
+    event_changes = 0
+    chengdu_corrections = 0
+    for row, log in zip(rows, logs):
+        row_dict = dict(row)
+        access_changed = any(
+            row_dict[field] != log[key]
+            for field, key in (
+                ("country", "country"),
+                ("region", "region"),
+                ("city", "city"),
+                ("latitude", "latitude"),
+                ("longitude", "longitude"),
+                ("location_precision", "locationPrecision"),
+            )
+        )
+        if access_changed:
+            access_changes += 1
+        if row_dict.get("country") == "CN" and row_dict.get("city") == "Chengdu" and log.get("city") != "Chengdu":
+            chengdu_corrections += 1
+
+        event_id = f"worker-log:{log['id']}"
+        event_row = event_rows.get(event_id)
+        if not event_row:
+            continue
+        event_dict = dict(event_row)
+        if any(
+            event_dict[field] != log[key]
+            for field, key in (
+                ("country", "country"),
+                ("region", "region"),
+                ("city", "city"),
+                ("latitude", "latitude"),
+                ("longitude", "longitude"),
+                ("location_precision", "locationPrecision"),
+            )
+        ):
+            event_changes += 1
+
+    return {
+        "accessLogs": len(logs),
+        "accessLogUpdates": access_changes,
+        "eventUpdates": event_changes,
+        "chengduCorrections": chengdu_corrections,
+    }
+
+
+def backfill_worker_log_geo() -> dict[str, int]:
+    worker_dimensions = ("worker_log:country", "worker_log:path", "worker_log:status", "worker_log:traffic")
+    with db_session() as connection:
+        rows = connection.execute("SELECT * FROM access_logs WHERE source = ?", (SYNC_TYPE_WORKER_LOG,)).fetchall()
+        logs = [
+            normalize_worker_access_log(dict(row), ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection))
+            for row in rows
+        ]
+        if not logs:
+            return {"accessLogs": 0, "events": 0, "aggregates": 0}
+
+        connection.executemany(
+            """
+            UPDATE access_logs
+            SET country = ?, region = ?, city = ?, latitude = ?, longitude = ?,
+                location_precision = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            [
+                (
+                    log.get("country", ""),
+                    log.get("region", ""),
+                    log.get("city", ""),
+                    float(log.get("latitude") or 0),
+                    float(log.get("longitude") or 0),
+                    log.get("locationPrecision", "estimated"),
+                    json.dumps(log.get("raw", {}), ensure_ascii=False),
+                    log["id"],
+                )
+                for log in logs
+            ],
+        )
+
+        event_updates = 0
+        for log in logs:
+            event_id = f"worker-log:{log['id']}"
+            event_row = connection.execute(
+                "SELECT raw_json FROM raw_events WHERE id = ? AND source = ?",
+                (event_id, SYNC_TYPE_WORKER_LOG),
+            ).fetchone()
+            if not event_row:
+                continue
+            cursor = connection.execute(
+                """
+                UPDATE raw_events
+                SET client_ip = ?, country = ?, region = ?, city = ?, latitude = ?, longitude = ?,
+                    location_precision = ?, asn = ?, raw_json = ?
+                WHERE id = ? AND source = ?
+                """,
+                (
+                    log.get("clientIp", ""),
+                    log.get("country", ""),
+                    log.get("region", ""),
+                    log.get("city", ""),
+                    float(log.get("latitude") or 0),
+                    float(log.get("longitude") or 0),
+                    log.get("locationPrecision", "estimated"),
+                    log.get("asn", ""),
+                    _merge_worker_event_raw(event_row["raw_json"], log),
+                    event_id,
+                    SYNC_TYPE_WORKER_LOG,
+                ),
+            )
+            event_updates += cursor.rowcount
+
+        connection.execute(
+            "DELETE FROM event_aggregates WHERE dimension IN (?, ?, ?, ?)",
+            worker_dimensions,
+        )
+        aggregate_count = _insert_worker_log_aggregate_rows(connection, _worker_aggregate_rows(logs))
+
+    return {"accessLogs": len(logs), "events": event_updates, "aggregates": aggregate_count}
+
+
+def preview_ip_geo_backfill() -> dict[str, int]:
+    with db_session() as connection:
+        access_rows = connection.execute("SELECT * FROM access_logs WHERE source = ?", (SYNC_TYPE_WORKER_LOG,)).fetchall()
+        access_logs = [
+            normalize_worker_access_log(dict(row), ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection))
+            for row in access_rows
+        ]
+        raw_rows = connection.execute("SELECT * FROM raw_events WHERE source = ?", (SYNC_TYPE_CLOUDFLARE,)).fetchall()
+        raw_updates = 0
+        raw_matches = 0
+        for row in raw_rows:
+            ip_location = lookup_ip_location(row["client_ip"], connection)
+            if not ip_location:
+                continue
+            raw_matches += 1
+            if (
+                row["country"] != ip_location.get("countryCode")
+                or row["region"] != ip_location.get("regionName")
+                or row["city"] != ip_location.get("cityName")
+                or row["latitude"] != ip_location.get("latitude")
+                or row["longitude"] != ip_location.get("longitude")
+                or row["location_precision"] != "city"
+            ):
+                raw_updates += 1
+
+    access_updates = 0
+    for row, log in zip(access_rows, access_logs):
+        row_dict = dict(row)
+        if any(
+            row_dict[field] != log[key]
+            for field, key in (
+                ("country", "country"),
+                ("region", "region"),
+                ("city", "city"),
+                ("latitude", "latitude"),
+                ("longitude", "longitude"),
+                ("location_precision", "locationPrecision"),
+            )
+        ):
+            access_updates += 1
+    return {
+        "accessLogs": len(access_logs),
+        "accessLogUpdates": access_updates,
+        "rawEvents": len(raw_rows),
+        "rawEventMatches": raw_matches,
+        "rawEventUpdates": raw_updates,
+    }
+
+
+def backfill_ip_geo() -> dict[str, int]:
+    worker_result = backfill_worker_log_geo()
+    raw_updates = 0
+    with db_session() as connection:
+        rows = connection.execute("SELECT * FROM raw_events WHERE source = ?", (SYNC_TYPE_CLOUDFLARE,)).fetchall()
+        for row in rows:
+            ip_location = lookup_ip_location(row["client_ip"], connection)
+            if not ip_location:
+                continue
+            latitude = float(ip_location.get("latitude") or 0)
+            longitude = float(ip_location.get("longitude") or 0)
+            location_precision = "city" if ip_location.get("cityName") else "region" if ip_location.get("regionName") else "country"
+            raw = _json_loads(row["raw_json"], {})
+            if not isinstance(raw, dict):
+                raw = {}
+            raw["geo"] = {
+                "source": ip_location.get("source", ""),
+                "edition": ip_location.get("edition", ""),
+                "country": ip_location.get("countryCode", ""),
+                "countryName": ip_location.get("countryName", ""),
+                "region": ip_location.get("regionName", ""),
+                "city": ip_location.get("cityName", ""),
+                "latitude": latitude,
+                "longitude": longitude,
+                "locationPrecision": location_precision,
+                "zipCode": ip_location.get("zipCode", ""),
+                "timeZone": ip_location.get("timeZone", ""),
+            }
+            cursor = connection.execute(
+                """
+                UPDATE raw_events
+                SET country = ?, region = ?, city = ?, latitude = ?, longitude = ?,
+                    location_precision = ?, raw_json = ?
+                WHERE id = ?
+                """,
+                (
+                    ip_location.get("countryCode", ""),
+                    ip_location.get("regionName", ""),
+                    ip_location.get("cityName", ""),
+                    latitude,
+                    longitude,
+                    location_precision,
+                    json.dumps(raw, ensure_ascii=False),
+                    row["id"],
+                ),
+            )
+            raw_updates += cursor.rowcount
+    return {
+        "accessLogs": worker_result["accessLogs"],
+        "events": worker_result["events"] + raw_updates,
+        "aggregates": worker_result["aggregates"],
+        "rawEventGeoUpdates": raw_updates,
+    }
 
 
 def seed_traffic_aggregates(source: str = "sample") -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 from typing import Any
 
 
@@ -32,6 +33,28 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def _float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _valid_coordinates(latitude: float | None, longitude: float | None) -> bool:
+    if latitude is None or longitude is None:
+        return False
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return False
+    return not (latitude == 0 and longitude == 0)
+
+
+def _stable_text_coordinates(value: str) -> tuple[float, float]:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    latitude = (int(digest[:8], 16) / 0xFFFFFFFF) * 120 - 60
+    longitude = (int(digest[8:16], 16) / 0xFFFFFFFF) * 300 - 150
+    return round(latitude, 4), round(longitude, 4)
+
+
 def stable_country_coordinates(country: Any) -> tuple[float, float, str]:
     normalized = _text(country).upper()
     if not normalized:
@@ -39,7 +62,46 @@ def stable_country_coordinates(country: Any) -> tuple[float, float, str]:
     if normalized in COUNTRY_COORDINATES:
         latitude, longitude = COUNTRY_COORDINATES[normalized]
         return latitude, longitude, "country"
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    latitude = (int(digest[:8], 16) / 0xFFFFFFFF) * 120 - 60
-    longitude = (int(digest[8:16], 16) / 0xFFFFFFFF) * 300 - 150
-    return round(latitude, 4), round(longitude, 4), "estimated"
+    latitude, longitude = _stable_text_coordinates(normalized)
+    return latitude, longitude, "estimated"
+
+
+def stable_ip_coordinates(client_ip: Any) -> tuple[float, float, str]:
+    text = _text(client_ip)
+    if not text:
+        return 0.0, 0.0, "estimated"
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return stable_country_coordinates(text)
+    if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified:
+        return 0.0, 0.0, "estimated"
+    latitude, longitude = _stable_text_coordinates(address.compressed)
+    return latitude, longitude, "estimated"
+
+
+def resolve_geo_coordinates(
+    *,
+    country: Any = "",
+    latitude: Any = None,
+    longitude: Any = None,
+    city: Any = "",
+    region: Any = "",
+    client_ip: Any = "",
+) -> tuple[float, float, str]:
+    parsed_latitude = _float(latitude)
+    parsed_longitude = _float(longitude)
+    if _valid_coordinates(parsed_latitude, parsed_longitude):
+        if _text(city):
+            precision = "city"
+        elif _text(region):
+            precision = "region"
+        elif _text(country):
+            precision = "country"
+        else:
+            precision = "estimated"
+        return round(parsed_latitude, 6), round(parsed_longitude, 6), precision
+
+    if _text(country):
+        return stable_country_coordinates(country)
+    return stable_ip_coordinates(client_ip)

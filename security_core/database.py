@@ -152,6 +152,26 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_access_logs_path ON access_logs (path)",
     "CREATE INDEX IF NOT EXISTS idx_access_logs_status_code ON access_logs (status_code)",
     """
+    CREATE TABLE IF NOT EXISTS ip2location_ranges (
+        provider TEXT NOT NULL DEFAULT 'ip2location_lite',
+        edition TEXT NOT NULL DEFAULT 'DB11',
+        ip_version INTEGER NOT NULL,
+        ip_from_key TEXT NOT NULL,
+        ip_to_key TEXT NOT NULL,
+        country_code TEXT NOT NULL DEFAULT '',
+        country_name TEXT NOT NULL DEFAULT '',
+        region_name TEXT NOT NULL DEFAULT '',
+        city_name TEXT NOT NULL DEFAULT '',
+        latitude REAL NOT NULL DEFAULT 0,
+        longitude REAL NOT NULL DEFAULT 0,
+        zip_code TEXT NOT NULL DEFAULT '',
+        time_zone TEXT NOT NULL DEFAULT '',
+        imported_at TEXT NOT NULL,
+        PRIMARY KEY (provider, edition, ip_version, ip_from_key, ip_to_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ip2location_ranges_lookup ON ip2location_ranges (provider, ip_version, ip_from_key)",
+    """
     CREATE TABLE IF NOT EXISTS sync_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sync_type TEXT NOT NULL DEFAULT 'cloudflare',

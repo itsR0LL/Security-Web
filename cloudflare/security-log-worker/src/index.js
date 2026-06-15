@@ -13,6 +13,18 @@ function trimText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function firstText(...values) {
+  for (const value of values) {
+    const text = trimText(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function headerText(request, name) {
+  return trimText(request.headers.get(name));
+}
+
 function readAuthToken(request, headerName) {
   const direct = trimText(request.headers.get(headerName));
   if (direct) return direct;
@@ -60,11 +72,27 @@ async function parseCollectPayload(request) {
   const url = new URL(request.url);
   const body = request.headers.get("Content-Type")?.includes("application/json") ? await request.json().catch(() => ({})) : {};
   const cf = request.cf || {};
-  const clientIp = trimText(body.clientIp) || trimText(request.headers.get("CF-Connecting-IP"));
+  const explicitClientIp = firstText(body.clientIp, body.client_ip);
+  const clientIp = explicitClientIp || headerText(request, "CF-Connecting-IP");
   const occurredAt = trimText(body.occurredAt) || new Date().toISOString();
   const pathValue = trimText(body.path) || sanitizePath(trimText(body.pathname) || url.pathname);
   const query = trimText(body.query) || trimText(body.search) || url.search.replace(/^\?/, "");
   const request_id = trimText(body.requestId) || requestId(request);
+  const requestLocationAllowed = !explicitClientIp;
+  const visitorLocation = {
+    country: firstText(body.country, requestLocationAllowed ? headerText(request, "CF-IPCountry") : "", requestLocationAllowed ? cf.country : ""),
+    region: firstText(body.region, requestLocationAllowed ? headerText(request, "CF-Region") : "", requestLocationAllowed ? cf.region : ""),
+    regionCode: firstText(body.regionCode, body.region_code, requestLocationAllowed ? headerText(request, "CF-Region-Code") : "", requestLocationAllowed ? cf.regionCode : ""),
+    city: firstText(body.city, requestLocationAllowed ? headerText(request, "CF-IPCity") : "", requestLocationAllowed ? cf.city : ""),
+    latitude: firstText(body.latitude, body.lat, requestLocationAllowed ? headerText(request, "CF-IPLatitude") : "", requestLocationAllowed ? cf.latitude : ""),
+    longitude: firstText(body.longitude, body.lon, requestLocationAllowed ? headerText(request, "CF-IPLongitude") : "", requestLocationAllowed ? cf.longitude : ""),
+    postalCode: firstText(body.postalCode, body.postal_code, requestLocationAllowed ? headerText(request, "CF-Postal-Code") : "", requestLocationAllowed ? cf.postalCode : ""),
+    timezone: firstText(body.timezone, requestLocationAllowed ? headerText(request, "CF-Timezone") : "", requestLocationAllowed ? cf.timezone : ""),
+    colo: firstText(body.colo, requestLocationAllowed ? cf.colo : ""),
+    asn: firstText(body.asn, requestLocationAllowed && cf.asn ? String(cf.asn) : ""),
+    asOrganization: firstText(body.asOrganization, body.as_organization, requestLocationAllowed ? cf.asOrganization : ""),
+    requestLocationUsed: requestLocationAllowed,
+  };
 
   return {
     id: trimText(body.id) || request_id,
@@ -72,10 +100,10 @@ async function parseCollectPayload(request) {
     occurred_at: occurredAt,
     client_ip: clientIp,
     ip_hash: clientIp ? await sha256Hex(clientIp) : "",
-    country: trimText(body.country) || trimText(cf.country),
-    region: trimText(body.region) || trimText(cf.region),
-    city: trimText(body.city) || trimText(cf.city),
-    colo: trimText(body.colo) || trimText(cf.colo),
+    country: visitorLocation.country,
+    region: visitorLocation.region,
+    city: visitorLocation.city,
+    colo: visitorLocation.colo,
     method: (trimText(body.method) || request.method || "GET").toUpperCase(),
     host: trimText(body.host) || trimText(request.headers.get("Host")),
     path: pathValue,
@@ -89,12 +117,19 @@ async function parseCollectPayload(request) {
     source: trimText(body.source) || "worker",
     raw_json: serializeRaw({
       body,
+      visitorLocation,
       cf: {
         country: cf.country,
         region: cf.region,
+        regionCode: cf.regionCode,
         city: cf.city,
+        latitude: cf.latitude,
+        longitude: cf.longitude,
+        postalCode: cf.postalCode,
+        timezone: cf.timezone,
         colo: cf.colo,
         asn: cf.asn,
+        asOrganization: cf.asOrganization,
         clientTcpRtt: cf.clientTcpRtt,
       },
     }),
@@ -116,8 +151,24 @@ async function collect(request, env) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       received_at = excluded.received_at,
+      occurred_at = excluded.occurred_at,
+      client_ip = excluded.client_ip,
+      ip_hash = excluded.ip_hash,
+      country = excluded.country,
+      region = excluded.region,
+      city = excluded.city,
+      colo = excluded.colo,
+      method = excluded.method,
+      host = excluded.host,
+      path = excluded.path,
+      query = excluded.query,
       status_code = excluded.status_code,
+      user_agent = excluded.user_agent,
+      referer = excluded.referer,
+      cf_ray = excluded.cf_ray,
+      request_id = excluded.request_id,
       response_bytes = excluded.response_bytes,
+      source = excluded.source,
       raw_json = excluded.raw_json
     `
   )

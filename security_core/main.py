@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse, Response
 from .attack_aggregator import AnalysisFilters, AttackAggregator
 from .cloudflare_client import CloudflareClient, CloudflareClientError
 from .config import DEFAULT_ALLOWED_ORIGINS, WORKER_LOG_EXPORT_TOKEN, WORKER_LOG_EXPORT_URL
-from .database import init_db, utc_now
+from .database import db_session, init_db, utc_now
 from .event_normalizer import build_http_aggregate_rows, normalize_security_events
+from .ip2location import lookup_ip_location
 from .repository import (
     count_events,
     create_sync_run,
@@ -392,7 +393,11 @@ def sync_run() -> dict[str, Any]:
     event_count = 0
     used_stale_data = False
     if fetched.security_events_read:
-        events_data = normalize_security_events(fetched.security_events)
+        with db_session() as connection:
+            events_data = normalize_security_events(
+                fetched.security_events,
+                ip_lookup=lambda client_ip: lookup_ip_location(client_ip, connection),
+            )
         event_count = replace_cloudflare_events(events_data)
     else:
         used_stale_data = True

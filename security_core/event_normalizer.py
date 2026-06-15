@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from .geo import stable_country_coordinates
+from .geo import resolve_geo_coordinates
+
+
+IpLookup = Callable[[Any], dict[str, Any] | None]
 
 
 CACHED_STATUSES = {"hit", "stale", "updating", "revalidated"}
@@ -59,7 +63,7 @@ def _event_id(row: dict[str, Any]) -> str:
     return "cloudflare:" + hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:24]
 
 
-def normalize_security_event(row: dict[str, Any]) -> dict[str, Any]:
+def normalize_security_event(row: dict[str, Any], ip_lookup: IpLookup | None = None) -> dict[str, Any]:
     action = _text(row.get("action"), "allow").lower()
     source = _text(row.get("source"), "cloudflare")
     rule_id = _text(row.get("ruleId"))
@@ -68,7 +72,25 @@ def normalize_security_event(row: dict[str, Any]) -> dict[str, Any]:
     method = _text(row.get("clientRequestHTTPMethodName"), "GET").upper()
     status_code = _int(row.get("edgeResponseStatus"))
     country = _text(row.get("clientCountryName"))
-    latitude, longitude, location_precision = stable_country_coordinates(country)
+    region = ""
+    city = ""
+    latitude_input = row.get("latitude")
+    longitude_input = row.get("longitude")
+    ip_location = ip_lookup(row.get("clientIP")) if ip_lookup else None
+    if ip_location:
+        country = country or _text(ip_location.get("countryCode"))
+        region = _text(ip_location.get("regionName"))
+        city = _text(ip_location.get("cityName"))
+        latitude_input = latitude_input if latitude_input is not None else ip_location.get("latitude")
+        longitude_input = longitude_input if longitude_input is not None else ip_location.get("longitude")
+    latitude, longitude, location_precision = resolve_geo_coordinates(
+        country=country,
+        latitude=latitude_input,
+        longitude=longitude_input,
+        city=city,
+        region=region,
+        client_ip=row.get("clientIP"),
+    )
     event_type = source or "cloudflare_security_event"
     risk_level = "info"
     confidence = 0.65
@@ -88,8 +110,8 @@ def normalize_security_event(row: dict[str, Any]) -> dict[str, Any]:
         "timestamp": _iso(row.get("datetime")),
         "clientIp": _text(row.get("clientIP")),
         "country": country,
-        "region": "",
-        "city": "",
+        "region": region,
+        "city": city,
         "latitude": latitude,
         "longitude": longitude,
         "locationPrecision": location_precision,
@@ -118,12 +140,27 @@ def normalize_security_event(row: dict[str, Any]) -> dict[str, Any]:
         "ruleHits": [],
         "aiClusterId": "",
         "ruleVersion": "",
-        "raw": {"cloudflare": row},
+        "raw": {
+            "cloudflare": row,
+            "geo": {
+                "source": _text(ip_location.get("source")) if ip_location else "",
+                "edition": _text(ip_location.get("edition")) if ip_location else "",
+                "country": country,
+                "countryName": _text(ip_location.get("countryName")) if ip_location else "",
+                "region": region,
+                "city": city,
+                "latitude": latitude,
+                "longitude": longitude,
+                "locationPrecision": location_precision,
+                "zipCode": _text(ip_location.get("zipCode")) if ip_location else "",
+                "timeZone": _text(ip_location.get("timeZone")) if ip_location else "",
+            },
+        },
     }
 
 
-def normalize_security_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [normalize_security_event(row) for row in rows if isinstance(row, dict)]
+def normalize_security_events(rows: list[dict[str, Any]], ip_lookup: IpLookup | None = None) -> list[dict[str, Any]]:
+    return [normalize_security_event(row, ip_lookup=ip_lookup) for row in rows if isinstance(row, dict)]
 
 
 def _sum_bytes(row: dict[str, Any]) -> int:
